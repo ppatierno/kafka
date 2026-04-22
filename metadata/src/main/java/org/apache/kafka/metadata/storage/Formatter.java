@@ -18,6 +18,9 @@
 package org.apache.kafka.metadata.storage;
 
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.VotersRecord;
+import org.apache.kafka.common.utils.internals.BufferSupplier;
+import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.metadata.MetadataRecordSerde;
 import org.apache.kafka.metadata.bootstrap.BootstrapDirectory;
@@ -25,6 +28,9 @@ import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
 import org.apache.kafka.metadata.properties.MetaProperties;
 import org.apache.kafka.metadata.properties.MetaPropertiesEnsemble;
 import org.apache.kafka.metadata.properties.MetaPropertiesVersion;
+import org.apache.kafka.metadata.util.BatchFileReader;
+import org.apache.kafka.raft.Batch;
+import org.apache.kafka.raft.ControlRecord;
 import org.apache.kafka.raft.DynamicVoters;
 import org.apache.kafka.raft.KafkaRaftClient;
 import org.apache.kafka.raft.VoterSet;
@@ -33,16 +39,21 @@ import org.apache.kafka.server.common.Feature;
 import org.apache.kafka.server.common.FeatureVersion;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.snapshot.FileRawSnapshotReader;
 import org.apache.kafka.snapshot.FileRawSnapshotWriter;
+import org.apache.kafka.snapshot.RecordsSnapshotReader;
 import org.apache.kafka.snapshot.RecordsSnapshotWriter;
+import org.apache.kafka.snapshot.SnapshotPath;
 import org.apache.kafka.snapshot.Snapshots;
 
 import java.io.File;
 import java.io.PrintStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
@@ -51,6 +62,7 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.stream.Stream;
 
 import static org.apache.kafka.common.internals.Topic.CLUSTER_METADATA_TOPIC_PARTITION;
 import static org.apache.kafka.server.common.KRaftVersion.KRAFT_VERSION_0;
@@ -527,5 +539,149 @@ public class Formatter {
         try (RecordsSnapshotWriter<ApiMessageAndVersion> writer = builder.build(new MetadataRecordSerde())) {
             writer.freeze();
         }
+    }
+
+    /**
+     * Read the currently persisted VoterSet from metadata log.
+     *
+     * This searches log segments first (most up-to-date), then falls back to the latest snapshot.
+     * Required for idempotent --override operation.
+     *
+     * Process:
+     * 1. Search .log files (newest first) for the latest VotersRecord
+     * 2. If not found in logs, read VotersRecord from latest .checkpoint snapshot
+     *
+     * @param logDir The log directory containing the metadata log
+     * @return The current VoterSet
+     * @throws Exception if reading fails or no VotersRecord found
+     */
+    VoterSet readPersistedVoterSet(String logDir) throws Exception {
+        Path metadataLogPath = Paths.get(logDir, String.format("%s-%d",
+            CLUSTER_METADATA_TOPIC_PARTITION.topic(),
+            CLUSTER_METADATA_TOPIC_PARTITION.partition()));
+
+        if (!Files.exists(metadataLogPath)) {
+            throw new FormatterException("Metadata log directory not found: " + metadataLogPath +
+                ". The directory may not be formatted with dynamic quorum mode.");
+        }
+
+        // First, search log segments (newest first) - most up-to-date source
+        VoterSet voterSet = readVoterSetFromMetadataLog(metadataLogPath);
+        if (voterSet != null) {
+            return voterSet;
+        }
+
+        // If not found in log, read from latest snapshot
+        List<Path> snapshots = new ArrayList<>();
+        try (Stream<Path> paths = Files.list(metadataLogPath)) {
+            paths.filter(p -> p.toString().endsWith(".checkpoint"))
+                 .sorted(Comparator.comparing(Path::getFileName).reversed())
+                 .forEach(snapshots::add);
+        }
+
+        if (!snapshots.isEmpty()) {
+            voterSet = readVoterSetFromSnapshot(snapshots.get(0));
+        }
+
+        if (voterSet == null) {
+            throw new FormatterException("No VotersRecord found in metadata log at " + metadataLogPath +
+                ". Found " + snapshots.size() + " snapshot(s). " +
+                "This directory may not be formatted with dynamic quorum mode (kraft.version >= 1).");
+        }
+
+        return voterSet;
+    }
+
+    /**
+     * Read VoterSet from a snapshot file.
+     *
+     * Reuses existing Kafka code:
+     * - Snapshots.parse() - parses snapshot filename to get OffsetAndEpoch
+     * - FileRawSnapshotReader.open() - opens snapshot file
+     * - RecordsSnapshotReader.of() - reads records from snapshot
+     * - VoterSet.fromVotersRecord() - converts VotersRecord to VoterSet
+     *
+     * @param snapshotPath Path to the snapshot file
+     * @return VoterSet if found in snapshot, null otherwise
+     * @throws Exception if reading fails
+     */
+    VoterSet readVoterSetFromSnapshot(Path snapshotPath) throws Exception {
+        Optional<SnapshotPath> parsedSnapshot = Snapshots.parse(snapshotPath);
+        if (parsedSnapshot.isEmpty()) {
+            return null;
+        }
+
+        SnapshotPath snapshot = parsedSnapshot.get();
+        Path logDir = snapshotPath.getParent();
+
+        try (RecordsSnapshotReader<ApiMessageAndVersion> reader = RecordsSnapshotReader.of(
+                FileRawSnapshotReader.open(logDir, snapshot.snapshotId()),
+                new MetadataRecordSerde(),
+                BufferSupplier.create(),
+                Integer.MAX_VALUE,
+                true,
+                new LogContext())) {
+
+            while (reader.hasNext()) {
+                Batch<ApiMessageAndVersion> batch = reader.next();
+                // VotersRecord is a control record, not a regular record
+                for (ControlRecord controlRecord : batch.controlRecords()) {
+                    if (controlRecord.message() instanceof VotersRecord) {
+                        return VoterSet.fromVotersRecord((VotersRecord) controlRecord.message());
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Read VoterSet from metadata log segments.
+     *
+     * Searches log segments in reverse order (newest first) and stops at the first VotersRecord found.
+     *
+     * Reuses existing Kafka code:
+     * - BatchFileReader - utility for reading log segments (also used by kafka-dump-log tool)
+     * - VoterSet.fromVotersRecord() - converts VotersRecord to VoterSet
+     *
+     * @param metadataPath Path to the metadata log directory
+     * @return Latest VoterSet found in logs, or null if none found
+     * @throws Exception if reading fails
+     */
+    VoterSet readVoterSetFromMetadataLog(Path metadataPath) throws Exception {
+        VoterSet latestInSegment = null;
+
+        // Find all .log files and sort in reverse order (newest first)
+        List<Path> logFiles = new ArrayList<>();
+        try (Stream<Path> paths = Files.list(metadataPath)) {
+            paths.filter(p -> p.toString().endsWith(".log"))
+                 .sorted(Comparator.reverseOrder())
+                 .forEach(logFiles::add);
+        }
+
+        // Replay log segments from newest to oldest
+        // Scan entire newest segment to find LAST VotersRecord (in case multiple exist)
+        for (Path logFile : logFiles) {
+            try (BatchFileReader reader = new BatchFileReader.Builder()
+                    .setPath(logFile.toString())
+                    .build()) {
+
+                while (reader.hasNext()) {
+                    BatchFileReader.BatchAndType bat = reader.next();
+                    if (bat.isControl()) {  // VotersRecord is a control record
+                        for (ApiMessageAndVersion record : bat.batch().records()) {
+                            if (record.message() instanceof VotersRecord) {
+                                // Keep scanning to find the latest one in this segment
+                                latestInSegment = VoterSet.fromVotersRecord(
+                                    (VotersRecord) record.message());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // No VotersRecord found in any log segment
+        return latestInSegment;
     }
 }

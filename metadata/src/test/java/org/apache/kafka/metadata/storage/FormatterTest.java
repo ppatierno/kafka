@@ -18,8 +18,12 @@
 package org.apache.kafka.metadata.storage;
 
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.VotersRecord;
 import org.apache.kafka.common.metadata.FeatureLevelRecord;
 import org.apache.kafka.common.metadata.UserScramCredentialRecord;
+import org.apache.kafka.common.record.internal.ControlRecordUtils;
+import org.apache.kafka.common.record.internal.FileRecords;
+import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.security.scram.internals.ScramFormatter;
 import org.apache.kafka.common.security.scram.internals.ScramMechanism;
 import org.apache.kafka.common.utils.Utils;
@@ -28,6 +32,7 @@ import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
 import org.apache.kafka.metadata.properties.MetaProperties;
 import org.apache.kafka.metadata.properties.MetaPropertiesEnsemble;
 import org.apache.kafka.raft.DynamicVoters;
+import org.apache.kafka.raft.VoterSet;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.server.common.EligibleLeaderReplicasVersion;
 import org.apache.kafka.server.common.Feature;
@@ -53,6 +58,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -611,6 +619,171 @@ public class FormatterTest {
                 "--override requires --initial-controllers to specify the new voter endpoints.",
                 assertThrows(FormatterException.class, formatter.formatter::run).getMessage()
             );
+        }
+    }
+
+    @Test
+    public void testReadPersistedVoterSetFromSnapshot() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Format with dynamic quorum (creates snapshot with VotersRecord)
+            DynamicVoters voters = DynamicVoters.parse("1@localhost:9093:4znU-ou9Taa06bmEJxsjnw,2@localhost:9094:5znU-ou9Taa06bmEJxsjnx,3@localhost:9095:6znU-ou9Taa06bmEJxsjny");
+
+            FormatterContext formatter = testEnv.newFormatter();
+            formatter.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(voters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            // Read the persisted VoterSet
+            VoterSet persistedVoterSet = formatter.formatter.readPersistedVoterSet(testEnv.directory(0));
+
+            assertNotNull(persistedVoterSet, "Should read VoterSet from snapshot");
+            assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
+            assertTrue(persistedVoterSet.voterIds().contains(1), "Should contain voter 1");
+            assertTrue(persistedVoterSet.voterIds().contains(2), "Should contain voter 2");
+            assertTrue(persistedVoterSet.voterIds().contains(3), "Should contain voter 3");
+        }
+    }
+
+    @Test
+    public void testReadPersistedVoterSetWithNoSnapshots() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Create a directory without formatting it (no snapshots)
+            FormatterContext formatter = testEnv.newFormatter();
+
+            // Should throw exception when metadata log directory doesn't exist
+            FormatterException exception = assertThrows(FormatterException.class,
+                () -> formatter.formatter.readPersistedVoterSet(testEnv.directory(0)));
+
+            assertTrue(exception.getMessage().contains("Metadata log directory not found"),
+                "Should indicate metadata log directory not found");
+        }
+    }
+
+    @Test
+    public void testReadPersistedVoterSetFromLog() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Format with initial VoterSet at original endpoints (snapshot created)
+            DynamicVoters initialVoters = DynamicVoters.parse(
+                "1@localhost:9093:4znU-ou9Taa06bmEJxsjnw,2@localhost:9094:5znU-ou9Taa06bmEJxsjnx,3@localhost:9095:6znU-ou9Taa06bmEJxsjny");
+
+            FormatterContext formatter = testEnv.newFormatter();
+            formatter.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(initialVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            // Create a log segment with updated VotersRecord (simulating DNS change)
+            // Same voter IDs and directory IDs, but different endpoints (port changes)
+            // NOTE: changing the hostname slows down the test because trying to resolve a non-existing host
+            DynamicVoters updatedVoters = DynamicVoters.parse(
+                "1@localhost:9096:4znU-ou9Taa06bmEJxsjnw,2@localhost:9097:5znU-ou9Taa06bmEJxsjnx,3@localhost:9098:6znU-ou9Taa06bmEJxsjny");
+            VotersRecord updatedVotersRecord = updatedVoters.toVoterSet("CONTROLLER")
+                .toVotersRecord(ControlRecordUtils.KRAFT_VOTERS_CURRENT_VERSION);
+
+            Path metadataLogPath = Paths.get(testEnv.directory(0), "__cluster_metadata-0");
+            Path logFile = metadataLogPath.resolve("00000000000000000000.log");
+
+            // Write a control batch with VotersRecord to the log file
+            writeVotersRecordToLog(logFile, updatedVotersRecord, 1L);
+
+            // Read the persisted VoterSet, should find the updated one from the log
+            VoterSet persistedVoterSet = formatter.formatter.readPersistedVoterSet(testEnv.directory(0));
+
+            // Verify we read the updated VoterSet from the log (not the snapshot)
+            assertNotNull(persistedVoterSet, "Should read VoterSet from log");
+            assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
+
+            // Use VoterSetDiff to verify only endpoints changed
+            VoterSet initialVoterSet = initialVoters.toVoterSet("CONTROLLER");
+            VoterSet updatedVoterSet = updatedVoters.toVoterSet("CONTROLLER");
+            VoterSetDiff diff = VoterSetDiff.compare(initialVoterSet, updatedVoterSet, "CONTROLLER");
+
+            assertTrue(diff.onlyEndpointsChanged(), "Should only have endpoint changes");
+            assertFalse(diff.hasVoterIdChanges(), "Should not have voter ID changes");
+            assertFalse(diff.hasDirectoryIdChanges(), "Should not have directory ID changes");
+            assertEquals(3, diff.endpointChanges().size(), "All 3 endpoints should change");
+
+            // Verify the persisted VoterSet matches the updated one
+            assertEquals(updatedVoterSet.voterIds(), persistedVoterSet.voterIds(), "VoterSet IDs should match");
+        }
+    }
+
+    @Test
+    public void testReadPersistedVoterSetFromLogWithMultipleUpdates() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Format with initial VoterSet at original endpoints (snapshot created)
+            DynamicVoters initialVoters = DynamicVoters.parse(
+                "1@localhost:9093:4znU-ou9Taa06bmEJxsjnw,2@localhost:9094:5znU-ou9Taa06bmEJxsjnx,3@localhost:9095:6znU-ou9Taa06bmEJxsjny");
+
+            FormatterContext formatter = testEnv.newFormatter();
+            formatter.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(initialVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            Path metadataLogPath = Paths.get(testEnv.directory(0), "__cluster_metadata-0");
+            Path logFile = metadataLogPath.resolve("00000000000000000000.log");
+
+            // Simulate multiple DNS changes by writing multiple VotersRecords to the same segment
+            // First update: change ports to 9096-9098
+            DynamicVoters firstUpdate = DynamicVoters.parse(
+                "1@localhost:9096:4znU-ou9Taa06bmEJxsjnw,2@localhost:9097:5znU-ou9Taa06bmEJxsjnx,3@localhost:9098:6znU-ou9Taa06bmEJxsjny");
+            VotersRecord firstUpdateRecord = firstUpdate.toVoterSet("CONTROLLER")
+                .toVotersRecord(ControlRecordUtils.KRAFT_VOTERS_CURRENT_VERSION);
+            writeVotersRecordToLog(logFile, firstUpdateRecord, 1L);
+
+            // Second update: change ports to 9099-9101 (this is the latest and should be returned)
+            DynamicVoters secondUpdate = DynamicVoters.parse(
+                "1@localhost:9099:4znU-ou9Taa06bmEJxsjnw,2@localhost:9100:5znU-ou9Taa06bmEJxsjnx,3@localhost:9101:6znU-ou9Taa06bmEJxsjny");
+            VotersRecord secondUpdateRecord = secondUpdate.toVoterSet("CONTROLLER")
+                .toVotersRecord(ControlRecordUtils.KRAFT_VOTERS_CURRENT_VERSION);
+            writeVotersRecordToLog(logFile, secondUpdateRecord, 2L);
+
+            // Read the persisted VoterSet which should return the LAST one (secondUpdate), not the first
+            VoterSet persistedVoterSet = formatter.formatter.readPersistedVoterSet(testEnv.directory(0));
+
+            // Verify we read the latest VoterSet from the log (second update, not first)
+            assertNotNull(persistedVoterSet, "Should read VoterSet from log");
+            assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
+
+            // Use VoterSetDiff to verify only endpoints changed
+            VoterSet secondVoterSet = secondUpdate.toVoterSet("CONTROLLER");
+            VoterSetDiff diff = VoterSetDiff.compare(secondVoterSet, persistedVoterSet, "CONTROLLER");
+
+            assertTrue(diff.onlyEndpointsChanged(), "Should only have endpoint changes");
+            assertFalse(diff.hasVoterIdChanges(), "Should not have voter ID changes");
+            assertFalse(diff.hasDirectoryIdChanges(), "Should not have directory ID changes");
+            assertEquals(3, diff.endpointChanges().size(), "All 3 endpoints should change");
+
+            // Verify the persisted VoterSet matches the updated one
+            assertEquals(secondVoterSet.voterIds(), persistedVoterSet.voterIds(), "VoterSet IDs should match");
+        }
+    }
+
+    /**
+     * Writes a VotersRecord as a control record to a log file.
+     * Uses MemoryRecords.withVotersRecord() factory method (similar to RecordsIteratorTest.buildControlRecords).
+     */
+    private void writeVotersRecordToLog(Path logFile, VotersRecord votersRecord, long offset) throws Exception {
+        MemoryRecords memoryRecords = MemoryRecords.withVotersRecord(
+            offset,
+            System.currentTimeMillis(),
+            1, // leader epoch
+            ByteBuffer.allocate(256), // 256 bytes is sufficient for VotersRecord with 3 voters
+            votersRecord
+        );
+
+        // Write to log file
+        try (FileRecords fileRecords = FileRecords.open(logFile.toFile())) {
+            fileRecords.append(memoryRecords);
+            fileRecords.flush();
         }
     }
 }
