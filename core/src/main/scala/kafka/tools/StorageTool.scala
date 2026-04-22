@@ -128,6 +128,7 @@ object StorageTool extends Logging {
       setClusterId(namespace.getString("cluster_id")).
       setUnstableFeatureVersionsEnabled(config.unstableFeatureVersionsEnabled).
       setIgnoreFormatted(namespace.getBoolean("ignore_formatted")).
+      setOverride(namespace.getBoolean("override")).
       setControllerListenerName(config.controllerListenerNames.get(0)).
       setMetadataLogDirectory(config.metadataLogDir)
 
@@ -146,8 +147,15 @@ object StorageTool extends Logging {
       })
     val initialControllers = namespace.getString("initial_controllers")
     val isStandalone = namespace.getBoolean("standalone")
+    val isOverride = namespace.getBoolean("override")
     val staticVotersEmpty = config.quorumConfig.voters().isEmpty
     formatter.setHasDynamicQuorum(staticVotersEmpty)
+
+    // Validate --override requires --initial-controllers
+    if (isOverride && Option(initialControllers).isEmpty) {
+      throw new TerseFailure("--override requires --initial-controllers to specify the new voter endpoints.")
+    }
+
     if (!staticVotersEmpty && (Option(initialControllers).isDefined || isStandalone)) {
       throw new TerseFailure("You cannot specify " +
         QuorumConfig.QUORUM_VOTERS_CONFIG + " and format the node " +
@@ -359,6 +367,11 @@ object StorageTool extends Logging {
         "MvDxzVmcRsaTz33bUuRU6A,2@example.com:8084:07R5amHmR32VDA6jHkGbTA\n. When setting this flag, " +
         "the controller.quorum.voters config must not be set, and controller.quorum.bootstrap.servers is set instead.")
       .action(store())
+
+    formatParser.addArgument("--override")
+      .help("When storage is already formatted, create snapshot with new VotersRecord instead of failing. " +
+        "Only allows endpoint (DNS/port) changes. Requires --initial-controllers.")
+      .action(storeTrue())
   }
 
   private def addVersionMappingParser(subparsers: Subparsers): Unit = {

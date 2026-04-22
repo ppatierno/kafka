@@ -913,4 +913,38 @@ Found problem:
         () => StorageTool.parseNameAndLevel("kraft.version=foo")).
         getMessage)
   }
+
+  @Test
+  def testOverrideRequiresInitialControllers(): Unit = {
+    val availableDirs = Seq(TestUtils.tempDir())
+    val properties = new Properties()
+    properties.putAll(defaultDynamicQuorumProperties)
+    properties.setProperty("log.dirs", availableDirs.mkString(","))
+
+    val stream = new ByteArrayOutputStream()
+    assertEquals(
+      "--override requires --initial-controllers to specify the new voter endpoints.",
+      assertThrows(classOf[TerseFailure], () =>
+        runFormatCommand(stream, properties, Seq(
+          "--override",
+          "--no-initial-controllers"
+        ))).getMessage
+    )
+  }
+
+  @Test
+  def testOverrideFlagCanBeSetWithInitialControllers(): Unit = {
+    val availableDirs = Seq(TestUtils.tempDir())
+    val properties = new Properties()
+    properties.putAll(defaultDynamicQuorumProperties)
+    properties.setProperty("log.dirs", availableDirs.mkString(","))
+
+    val stream = new ByteArrayOutputStream()
+    assertEquals(0, runFormatCommand(stream, properties, Seq(
+      "--release-version", "3.9-IV0",
+      "--initial-controllers", "0@localhost:9093:K90IZ-0DRNazJ49kCZ1EMQ",
+      "--override"
+    )))
+    assertTrue(stream.toString().contains("Formatting"))
+  }
 }

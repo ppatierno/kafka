@@ -587,4 +587,30 @@ public class FormatterTest {
             assertNotNull(logDirProps1);
         }
     }
+
+    @Test
+    public void testOverrideFlagCanBeSet() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            FormatterContext formatter = testEnv.newFormatter();
+            formatter.formatter
+                .setInitialControllers(DynamicVoters.parse("1@localhost:8020:4znU-ou9Taa06bmEJxsjnw"))
+                .setHasDynamicQuorum(true)
+                .setOverride(true);
+
+            assertTrue(true);
+        }
+    }
+
+    @Test
+    public void testOverrideRequiresInitialControllers() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            FormatterContext formatter = testEnv.newFormatter();
+            formatter.formatter.setOverride(true);
+
+            assertEquals(
+                "--override requires --initial-controllers to specify the new voter endpoints.",
+                assertThrows(FormatterException.class, formatter.formatter::run).getMessage()
+            );
+        }
+    }
 }

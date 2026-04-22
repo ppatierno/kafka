@@ -113,6 +113,11 @@ public class Formatter {
     private boolean ignoreFormatted = false;
 
     /**
+     * True if we should create a snapshot with updated VotersRecord when already formatted.
+     */
+    private boolean override = false;
+
+    /**
      * The arguments passed to --add-scram
      */
     private List<String> scramArguments = List.of();
@@ -192,6 +197,11 @@ public class Formatter {
         return this;
     }
 
+    public Formatter setOverride(boolean override) {
+        this.override = override;
+        return this;
+    }
+
     public Formatter setScramArguments(List<String> scramArguments) {
         this.scramArguments = scramArguments;
         return this;
@@ -225,6 +235,10 @@ public class Formatter {
         return hasDynamicQuorum;
     }
 
+    boolean isOverride() {
+        return override;
+    }
+
     public BootstrapMetadata bootstrapMetadata() {
         return bootstrapMetadata;
     }
@@ -241,6 +255,10 @@ public class Formatter {
         }
         if (controllerListenerName == null) {
             throw new FormatterException("You must specify the name of the initial controller listener.");
+        }
+        // Validate override requires initial-controllers (Formatter-level check)
+        if (override && initialControllers.isEmpty()) {
+            throw new FormatterException("--override requires --initial-controllers to specify the new voter endpoints.");
         }
         metadataLogDirectory.ifPresent(d -> {
             if (!directories.contains(d)) {
