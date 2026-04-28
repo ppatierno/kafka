@@ -767,6 +767,36 @@ public class FormatterTest {
         }
     }
 
+    @Test
+    public void testOverrideDoesNotFailOnFormattedStorage() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Step 1: Format storage initially
+            DynamicVoters initialVoters = DynamicVoters.parse("1@localhost:9093:4znU-ou9Taa06bmEJxsjnw");
+            FormatterContext formatter1 = testEnv.newFormatter();
+            formatter1.formatter
+                    .setUnstableFeatureVersionsEnabled(true)
+                    .setInitialControllers(initialVoters)
+                    .setHasDynamicQuorum(true)
+                    .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                    .run();
+
+            // Step 2: Run format --override on already-formatted storage
+            // This should NOT throw "already formatted" error
+            DynamicVoters newVoters = DynamicVoters.parse("1@localhost:9094:4znU-ou9Taa06bmEJxsjnw");
+            FormatterContext formatter2 = testEnv.newFormatter();
+            formatter2.formatter
+                    .setUnstableFeatureVersionsEnabled(true)
+                    .setInitialControllers(newVoters)
+                    .setHasDynamicQuorum(true)
+                    .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                    .setOverride(true);
+
+            // This should not throw an exception
+            assertDoesNotThrow(() -> formatter2.formatter.run(),
+                    "Format with --override should not fail on already-formatted storage");
+        }
+    }
+
     /**
      * Writes a VotersRecord as a control record to a log file.
      * Uses MemoryRecords.withVotersRecord() factory method (similar to RecordsIteratorTest.buildControlRecords).

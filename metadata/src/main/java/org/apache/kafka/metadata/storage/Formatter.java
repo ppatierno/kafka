@@ -424,7 +424,7 @@ public class Formatter {
                 OptionalInt.of(nodeId),
                 EnumSet.noneOf(MetaPropertiesEnsemble.VerificationFlag.class));
         MetaPropertiesEnsemble.Copier copier = new MetaPropertiesEnsemble.Copier(ensemble);
-        if (!(ignoreFormatted || copier.logDirProps().isEmpty())) {
+        if (!(ignoreFormatted || override || copier.logDirProps().isEmpty())) {
             String firstLogDir = copier.logDirProps().keySet().iterator().next();
             throw new FormatterException("Log directory " + firstLogDir + " is already formatted. " +
                 "Use --ignore-formatted to ignore this directory and format the others.");
