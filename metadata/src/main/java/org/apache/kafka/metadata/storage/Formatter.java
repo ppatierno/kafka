@@ -437,7 +437,13 @@ public class Formatter {
             }
         }
         if (ensemble.emptyLogDirs().isEmpty()) {
-            printStream.println("All of the log directories are already formatted.");
+            if (override) {
+                // Handle override mode: update VoterSet if needed
+                handleOverride(metadataLogDirectory.orElseThrow(() ->
+                    new FormatterException("Override mode requires metadata log directory")));
+            } else {
+                printStream.println("All of the log directories are already formatted.");
+            }
         } else {
             printStream.println("Bootstrap metadata: " + bootstrapMetadata);
             Map<String, DirectoryType> directoryTypes = new HashMap<>();
@@ -539,6 +545,70 @@ public class Formatter {
         try (RecordsSnapshotWriter<ApiMessageAndVersion> writer = builder.build(new MetadataRecordSerde())) {
             writer.freeze();
         }
+    }
+
+    /**
+     * Handle --override mode: update VoterSet if needed.
+     *
+     * This method provides idempotent, safe VoterSet updates for cloud-native environments
+     * where kafka-storage.sh runs on every pod start (e.g., Strimzi).
+     *
+     * Safety guarantees:
+     * - Only allows endpoint (DNS/port) changes
+     * - Rejects voter ID changes (topology changes)
+     * - Rejects directory ID changes (prevents data loss)
+     * - Idempotent: safe to run multiple times
+     *
+     * @param logDir The log directory containing the metadata log
+     * @throws FormatterException if changes are unsafe or validation fails
+     */
+    private void handleOverride(String logDir) throws Exception {
+        printStream.println("Storage directory " + logDir + " is already formatted.");
+        printStream.println("Override mode enabled, checking if VoterSet needs updating...");
+        printStream.println();
+
+        // Read persisted VoterSet from checkpoint or metadata log
+        VoterSet persistedVoterSet = readPersistedVoterSet(logDir);
+        printStream.println("Persisted VoterSet:");
+        printStream.println(persistedVoterSet);
+        printStream.println();
+
+        // Get provided VoterSet from --initial-controllers
+        if (initialControllers.isEmpty()) {
+            throw new FormatterException("--override requires --initial-controllers to specify the new voter endpoints.");
+        }
+        VoterSet providedVoterSet = initialControllers.get().toVoterSet(controllerListenerName);
+        printStream.println("Provided VoterSet (from --initial-controllers):");
+        printStream.println(providedVoterSet);
+        printStream.println();
+
+        // Detect changes using VoterSetDiff (compares hostname/port only, ignoring resolved IPs)
+        VoterSetDiff diff = VoterSetDiff.compare(persistedVoterSet, providedVoterSet, controllerListenerName);
+
+        // Idempotence check: if no changes detected, skip override
+        if (!diff.hasVoterIdChanges() && !diff.hasDirectoryIdChanges() && diff.endpointChanges().isEmpty()) {
+            printStream.println("No changes detected (VoterSets are equivalent). Override operation skipped, already up to date.");
+            return;
+        }
+
+        printStream.println("Changes detected:");
+        printStream.println(diff);
+        printStream.println();
+
+        // Validate safety: only endpoint changes allowed
+        if (!diff.onlyEndpointsChanged()) {
+            throw new FormatterException(
+                "--override cannot be used for changing node IDs or directory IDs.\n" +
+                "Changes detected:\n" + diff
+            );
+        }
+
+        printStream.println("Validation: PASSED (only endpoints changed, safe operation)");
+        printStream.println();
+
+        // TODO: Create snapshot with updated VoterSet
+        printStream.println("Snapshot creation not yet implemented.");
+        printStream.println("Override validation complete.");
     }
 
     /**

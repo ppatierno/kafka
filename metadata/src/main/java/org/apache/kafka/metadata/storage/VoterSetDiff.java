@@ -65,6 +65,15 @@ public class VoterSetDiff {
         return endpointChanges;
     }
 
+    @Override
+    public String toString() {
+        return "VoterSetDiff{" +
+               "hasVoterIdChanges=" + hasVoterIdChanges +
+               ", hasDirectoryIdChanges=" + hasDirectoryIdChanges +
+               ", endpointChanges=" + endpointChanges +
+               '}';
+    }
+
     /**
      * Compare two VoterSets and return detailed diff.
      *
@@ -113,12 +122,31 @@ public class VoterSetDiff {
             InetSocketAddress providedAddr = providedNode.listeners()
                 .address(new ListenerName(controllerListenerName)).orElse(null);
 
-            if (persistedAddr != null && providedAddr != null && !persistedAddr.equals(providedAddr)) {
+            // Compare hostname and port only, not resolved IP address
+            // This prevents false positives when one address is resolved and the other is not
+            if (persistedAddr != null && providedAddr != null && !endpointsMatch(persistedAddr, providedAddr)) {
                 endpointChanges.put(voterId, providedAddr);
             }
         }
 
         return new VoterSetDiff(hasVoterIdChanges, hasDirectoryIdChanges, endpointChanges);
+    }
+
+    /**
+     * Compare two InetSocketAddress objects by hostname and port only, ignoring resolved IP.
+     *
+     * This prevents false positives when comparing endpoints where one has been DNS-resolved
+     * and the other hasn't. For example:
+     *   - localhost/<unresolved>:9093
+     *   - localhost/127.0.0.1:9093
+     * These should be considered the same endpoint.
+     *
+     * @param addr1 First address
+     * @param addr2 Second address
+     * @return true if hostname and port match, false otherwise
+     */
+    private static boolean endpointsMatch(InetSocketAddress addr1, InetSocketAddress addr2) {
+        return addr1.getHostString().equals(addr2.getHostString()) && addr1.getPort() == addr2.getPort();
     }
 
     /**

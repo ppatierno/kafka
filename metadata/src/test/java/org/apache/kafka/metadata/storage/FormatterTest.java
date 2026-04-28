@@ -753,17 +753,22 @@ public class FormatterTest {
             assertNotNull(persistedVoterSet, "Should read VoterSet from log");
             assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
 
-            // Use VoterSetDiff to verify only endpoints changed
+            // Verify the persisted VoterSet matches the second update (not the first)
+            VoterSet initialVoterSet = initialVoters.toVoterSet("CONTROLLER");
             VoterSet secondVoterSet = secondUpdate.toVoterSet("CONTROLLER");
-            VoterSetDiff diff = VoterSetDiff.compare(secondVoterSet, persistedVoterSet, "CONTROLLER");
 
-            assertTrue(diff.onlyEndpointsChanged(), "Should only have endpoint changes");
+            // Compare initial with second to verify only endpoints changed
+            VoterSetDiff diff = VoterSetDiff.compare(initialVoterSet, secondVoterSet, "CONTROLLER");
+            assertTrue(diff.onlyEndpointsChanged(), "Should only have endpoint changes from initial to second");
             assertFalse(diff.hasVoterIdChanges(), "Should not have voter ID changes");
             assertFalse(diff.hasDirectoryIdChanges(), "Should not have directory ID changes");
             assertEquals(3, diff.endpointChanges().size(), "All 3 endpoints should change");
 
-            // Verify the persisted VoterSet matches the updated one
-            assertEquals(secondVoterSet.voterIds(), persistedVoterSet.voterIds(), "VoterSet IDs should match");
+            // Verify the persisted VoterSet matches the second update (using VoterSetDiff to handle resolved IPs)
+            VoterSetDiff persistedDiff = VoterSetDiff.compare(secondVoterSet, persistedVoterSet, "CONTROLLER");
+            assertFalse(persistedDiff.hasVoterIdChanges(), "Persisted should have same voter IDs as second update");
+            assertFalse(persistedDiff.hasDirectoryIdChanges(), "Persisted should have same directory IDs as second update");
+            assertTrue(persistedDiff.endpointChanges().isEmpty(), "Persisted should have same endpoints as second update");
         }
     }
 
@@ -794,6 +799,142 @@ public class FormatterTest {
             // This should not throw an exception
             assertDoesNotThrow(() -> formatter2.formatter.run(),
                     "Format with --override should not fail on already-formatted storage");
+
+            // Verify output contains expected messages
+            String output = formatter2.output();
+            assertTrue(output.contains("Override mode enabled"), "Should show override mode message");
+            assertTrue(output.contains("Validation: PASSED"), "Should show validation passed");
+        }
+    }
+
+    @Test
+    public void testOverrideWithEndpointChanges() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Step 1: Format storage with initial endpoints
+            DynamicVoters initialVoters = DynamicVoters.parse(
+                "1@localhost:9093:4znU-ou9Taa06bmEJxsjnw,2@localhost:9094:5znU-ou9Taa06bmEJxsjnx,3@localhost:9095:6znU-ou9Taa06bmEJxsjny");
+            FormatterContext formatter1 = testEnv.newFormatter();
+            formatter1.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(initialVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            // Step 2: Run format --override with new endpoints (only port changes)
+            DynamicVoters newVoters = DynamicVoters.parse(
+                "1@localhost:9096:4znU-ou9Taa06bmEJxsjnw,2@localhost:9097:5znU-ou9Taa06bmEJxsjnx,3@localhost:9098:6znU-ou9Taa06bmEJxsjny");
+            FormatterContext formatter2 = testEnv.newFormatter();
+            formatter2.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(newVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .setOverride(true)
+                .run();
+
+            // Verify output messages
+            String output = formatter2.output();
+            assertTrue(output.contains("Override mode enabled"), "Should show override mode enabled");
+            assertTrue(output.contains("Persisted VoterSet"), "Should show persisted VoterSet");
+            assertTrue(output.contains("Provided VoterSet"), "Should show provided VoterSet");
+            assertTrue(output.contains("Changes detected"), "Should show changes detected");
+            assertTrue(output.contains("Validation: PASSED"), "Should pass validation for endpoint changes");
+            assertTrue(output.contains("only endpoints changed"), "Should indicate only endpoint changes");
+        }
+    }
+
+    @Test
+    public void testOverrideIdempotence() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Step 1: Format storage
+            DynamicVoters voters = DynamicVoters.parse("1@localhost:9093:4znU-ou9Taa06bmEJxsjnw");
+            FormatterContext formatter1 = testEnv.newFormatter();
+            formatter1.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(voters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            // Step 2: Run format --override with SAME endpoints (idempotence test)
+            FormatterContext formatter2 = testEnv.newFormatter();
+            formatter2.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(voters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .setOverride(true)
+                .run();
+
+            // Verify idempotence - should skip with no changes
+            String output = formatter2.output();
+            assertTrue(output.contains("Override mode enabled"), "Should show override mode enabled");
+            assertTrue(output.contains("No changes detected (VoterSets are equivalent). Override operation skipped, already up to date."), "Should detect no changes and skip override");
+        }
+    }
+
+    @Test
+    public void testOverrideRejectsVoterIdChanges() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Step 1: Format storage with voters 1,2,3
+            DynamicVoters initialVoters = DynamicVoters.parse(
+                "1@localhost:9093:4znU-ou9Taa06bmEJxsjnw,2@localhost:9094:5znU-ou9Taa06bmEJxsjnx,3@localhost:9095:6znU-ou9Taa06bmEJxsjny");
+            FormatterContext formatter1 = testEnv.newFormatter();
+            formatter1.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(initialVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            // Step 2: Try to override with different voter IDs (1,2,4 instead of 1,2,3)
+            DynamicVoters newVoters = DynamicVoters.parse(
+                "1@localhost:9093:4znU-ou9Taa06bmEJxsjnw,2@localhost:9094:5znU-ou9Taa06bmEJxsjnx,4@localhost:9096:7znU-ou9Taa06bmEJxsjnz");
+            FormatterContext formatter2 = testEnv.newFormatter();
+            formatter2.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(newVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .setOverride(true);
+
+            // Should throw exception for voter ID changes
+            FormatterException exception = assertThrows(FormatterException.class,
+                () -> formatter2.formatter.run());
+            assertTrue(exception.getMessage().contains("--override cannot be used for changing node IDs or directory IDs."),
+                "Should reject voter ID changes");
+        }
+    }
+
+    @Test
+    public void testOverrideRejectsDirectoryIdChanges() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Step 1: Format storage with original directory IDs
+            DynamicVoters initialVoters = DynamicVoters.parse("1@localhost:9093:4znU-ou9Taa06bmEJxsjnw");
+            FormatterContext formatter1 = testEnv.newFormatter();
+            formatter1.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(initialVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            // Step 2: Try to override with DIFFERENT directory ID (critical safety check)
+            DynamicVoters newVoters = DynamicVoters.parse("1@localhost:9093:5znU-ou9Taa06bmEJxsjnx");
+            FormatterContext formatter2 = testEnv.newFormatter();
+            formatter2.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(newVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .setOverride(true);
+
+            // Should throw exception for directory ID changes (prevents data loss)
+            FormatterException exception = assertThrows(FormatterException.class,
+                () -> formatter2.formatter.run());
+            assertTrue(exception.getMessage().contains("--override cannot be used for changing node IDs or directory IDs."),
+                "Should reject directory ID changes");
         }
     }
 
