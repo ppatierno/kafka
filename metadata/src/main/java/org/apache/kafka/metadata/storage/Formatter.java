@@ -18,6 +18,7 @@
 package org.apache.kafka.metadata.storage;
 
 import org.apache.kafka.common.Uuid;
+import org.apache.kafka.common.message.KRaftVersionRecord;
 import org.apache.kafka.common.message.VotersRecord;
 import org.apache.kafka.common.utils.internals.BufferSupplier;
 import org.apache.kafka.common.utils.LogContext;
@@ -39,6 +40,7 @@ import org.apache.kafka.server.common.Feature;
 import org.apache.kafka.server.common.FeatureVersion;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.OffsetAndEpoch;
 import org.apache.kafka.snapshot.FileRawSnapshotReader;
 import org.apache.kafka.snapshot.FileRawSnapshotWriter;
 import org.apache.kafka.snapshot.RecordsSnapshotReader;
@@ -474,7 +476,8 @@ public class Formatter {
                     writeDynamicQuorumSnapshot(writeLogDir,
                         initialControllers.get(),
                         featureLevels.get(KRaftVersion.FEATURE_NAME),
-                        controllerListenerName);
+                        controllerListenerName,
+                        Snapshots.BOOTSTRAP_SNAPSHOT_ID);
                 }
             });
             copier.setWriteErrorHandler((errorLogDir, e) -> {
@@ -527,7 +530,8 @@ public class Formatter {
         String writeLogDir,
         DynamicVoters initialControllers,
         short kraftVersion,
-        String controllerListenerName
+        String controllerListenerName,
+        OffsetAndEpoch snapshotId
     ) {
         File parentDir = new File(writeLogDir);
         File clusterMetadataDirectory = new File(parentDir, String.format("%s-%d",
@@ -539,7 +543,7 @@ public class Formatter {
             setMaxBatchSizeBytes(KafkaRaftClient.MAX_BATCH_SIZE_BYTES).
             setRawSnapshotWriter(FileRawSnapshotWriter.create(
                 clusterMetadataDirectory.toPath(),
-                Snapshots.BOOTSTRAP_SNAPSHOT_ID)).
+                snapshotId)).
             setKraftVersion(KRaftVersion.fromFeatureLevel(kraftVersion)).
             setVoterSet(Optional.of(voterSet));
         try (RecordsSnapshotWriter<ApiMessageAndVersion> writer = builder.build(new MetadataRecordSerde())) {
@@ -567,8 +571,13 @@ public class Formatter {
         printStream.println("Override mode enabled, checking if VoterSet needs updating...");
         printStream.println();
 
-        // Read persisted VoterSet from checkpoint or metadata log
-        VoterSet persistedVoterSet = readPersistedVoterSet(logDir);
+        // Read persisted state from metadata log or snapshot
+        VoterSetWriteInfo writeInfo = readVoterSetWriteInfo(logDir);
+        printStream.println("VoterSetWriteInfo:");
+        printStream.println(writeInfo);
+        printStream.println();
+
+        VoterSet persistedVoterSet = writeInfo.voterSet();
         printStream.println("Persisted VoterSet:");
         printStream.println(persistedVoterSet);
         printStream.println();
@@ -612,20 +621,17 @@ public class Formatter {
     }
 
     /**
-     * Read the currently persisted VoterSet from metadata log.
+     * Read all information needed for VoterSet update from metadata log or snapshot.
      *
-     * This searches log segments first (most up-to-date), then falls back to the latest snapshot.
-     * Required for idempotent --override operation.
-     *
-     * Process:
-     * 1. Search .log files (newest first) for the latest VotersRecord
-     * 2. If not found in logs, read VotersRecord from latest .checkpoint snapshot
+     * This method orchestrates reading from multiple sources:
+     * 1. Try reading from metadata log segments (most up-to-date)
+     * 2. If log data incomplete or missing, supplement/fallback to snapshot
      *
      * @param logDir The log directory containing the metadata log
-     * @return The current VoterSet
-     * @throws Exception if reading fails or no VotersRecord found
+     * @return VoterSetWriteInfo with all necessary information
+     * @throws Exception if reading fails or no data found
      */
-    VoterSet readPersistedVoterSet(String logDir) throws Exception {
+    VoterSetWriteInfo readVoterSetWriteInfo(String logDir) throws Exception {
         Path metadataLogPath = Paths.get(logDir, String.format("%s-%d",
             CLUSTER_METADATA_TOPIC_PARTITION.topic(),
             CLUSTER_METADATA_TOPIC_PARTITION.partition()));
@@ -635,54 +641,161 @@ public class Formatter {
                 ". The directory may not be formatted with dynamic quorum mode.");
         }
 
-        // First, search log segments (newest first) - most up-to-date source
-        VoterSet voterSet = readVoterSetFromMetadataLog(metadataLogPath);
-        if (voterSet != null) {
-            return voterSet;
+        // Try reading from metadata log first
+        VoterSetWriteInfo writeInfo = readVoterSetWriteInfoFromMetadataLog(metadataLogPath);
+
+        // If no log data or missing VoterSet, read from snapshot
+        if (writeInfo == null || writeInfo.voterSet() == null) {
+            // Find latest snapshot
+            List<Path> snapshots = new ArrayList<>();
+            try (Stream<Path> paths = Files.list(metadataLogPath)) {
+                paths.filter(p -> p.toString().endsWith(".checkpoint"))
+                     .sorted(Comparator.comparing(Path::getFileName).reversed())
+                     .forEach(snapshots::add);
+            }
+
+            if (snapshots.isEmpty()) {
+                throw new FormatterException("No metadata log data or snapshots found in " + metadataLogPath +
+                    ". The directory may not be formatted with dynamic quorum mode.");
+            }
+
+            VoterSetWriteInfo snapshotInfo = readVoterSetWriteInfoFromSnapshot(snapshots.get(0));
+
+            // If we have log info but no VoterSet, supplement with VoterSet from snapshot
+            if (writeInfo != null) {
+                writeInfo = new VoterSetWriteInfo(
+                    writeInfo.lastOffsetAndEpoch(),
+                    writeInfo.kraftVersion(),
+                    snapshotInfo.voterSet()
+                );
+            } else {
+                // No log data at all, use snapshot entirely
+                writeInfo = snapshotInfo;
+            }
         }
 
-        // If not found in log, read from latest snapshot
-        List<Path> snapshots = new ArrayList<>();
-        try (Stream<Path> paths = Files.list(metadataLogPath)) {
-            paths.filter(p -> p.toString().endsWith(".checkpoint"))
-                 .sorted(Comparator.comparing(Path::getFileName).reversed())
-                 .forEach(snapshots::add);
-        }
-
-        if (!snapshots.isEmpty()) {
-            voterSet = readVoterSetFromSnapshot(snapshots.get(0));
-        }
-
-        if (voterSet == null) {
-            throw new FormatterException("No VotersRecord found in metadata log at " + metadataLogPath +
-                ". Found " + snapshots.size() + " snapshot(s). " +
-                "This directory may not be formatted with dynamic quorum mode (kraft.version >= 1).");
-        }
-
-        return voterSet;
+        return writeInfo;
     }
 
     /**
-     * Read VoterSet from a snapshot file.
+     * Holds all the information needed to write a snapshot with updated VoterSet.
+     * Extracted in a single pass through log segments or snapshot for efficiency.
      *
-     * Reuses existing Kafka code:
-     * - Snapshots.parse() - parses snapshot filename to get OffsetAndEpoch
-     * - FileRawSnapshotReader.open() - opens snapshot file
-     * - RecordsSnapshotReader.of() - reads records from snapshot
-     * - VoterSet.fromVotersRecord() - converts VotersRecord to VoterSet
+     * @param lastOffsetAndEpoch Last offset and epoch in the metadata log/snapshot (where the new snapshot will be created)
+     * @param kraftVersion kraft.version to include in snapshot
+     * @param voterSet Most recent VoterSet found while reading to lastOffsetAndEpoch (may be null if not found in log)
+     */
+    record VoterSetWriteInfo(OffsetAndEpoch lastOffsetAndEpoch, short kraftVersion, VoterSet voterSet) { }
+
+    /**
+     * Read information needed for VoterSet update in a single pass through log segments.
      *
-     * @param snapshotPath Path to the snapshot file
-     * @return VoterSet if found in snapshot, null otherwise
+     * This method extracts from log segments ONLY:
+     * - Offset and epoch (where to create new snapshot)
+     * - kraft.version (to include in snapshot)
+     * - Latest VoterSet (may be null if not found in log segments)
+     *
+     * Returns null if no usable log data exists (no segments or empty segments).
+     * Caller should fall back to reading from snapshot.
+     *
+     * @param metadataLogPath Path to the metadata log directory
+     * @return VoterSetWriteInfo with extracted information, or null if no log data
      * @throws Exception if reading fails
      */
-    VoterSet readVoterSetFromSnapshot(Path snapshotPath) throws Exception {
+    VoterSetWriteInfo readVoterSetWriteInfoFromMetadataLog(Path metadataLogPath) throws Exception {
+        if (!Files.exists(metadataLogPath)) {
+            return null;
+        }
+
+        // Find all .log segment files (sorted newest first for VoterSet search)
+        List<Path> logSegments = new ArrayList<>();
+        try (Stream<Path> paths = Files.list(metadataLogPath)) {
+            paths.filter(p -> p.toString().endsWith(".log"))
+                 .sorted(Comparator.reverseOrder())  // Newest first
+                 .forEach(logSegments::add);
+        }
+
+        long maxOffset = -1;
+        int maxEpoch = 0;
+        short kraftVersion = KRAFT_VERSION_1.featureLevel(); // Default to version 1
+        VoterSet latestVoterSet = null;
+
+        // Single pass through log segments: extract everything
+        for (Path segmentPath : logSegments) {
+            try (BatchFileReader reader = new BatchFileReader.Builder()
+                    .setPath(segmentPath.toString())
+                    .build()) {
+
+                while (reader.hasNext()) {
+                    BatchFileReader.BatchAndType batchAndType = reader.next();
+                    Batch<ApiMessageAndVersion> batch = batchAndType.batch();
+
+                    // Track the highest offset and epoch
+                    long lastOffset = batch.lastOffset();
+                    if (lastOffset > maxOffset) {
+                        maxOffset = lastOffset;
+                        maxEpoch = batch.epoch();
+                    }
+
+                    // Extract control records (VotersRecord and KRaftVersionRecord)
+                    if (batchAndType.isControl()) {
+                        for (ApiMessageAndVersion record : batch.records()) {
+                            if (record.message() instanceof VotersRecord) {
+                                // Keep scanning to find the latest one in this segment
+                                latestVoterSet = VoterSet.fromVotersRecord((VotersRecord) record.message());
+                            } else if (record.message() instanceof KRaftVersionRecord) {
+                                kraftVersion = ((KRaftVersionRecord) record.message()).kRaftVersion();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Optimization: If we found a VoterSet in the newest segment, we can stop
+            // (segments are sorted newest-first)
+            if (latestVoterSet != null) {
+                break;
+            }
+        }
+
+        // No usable log data - caller should read from snapshot
+        if (maxOffset < 0) {
+            return null;
+        }
+
+        // Return with potentially null voterSet (caller will handle fallback to snapshot)
+        return new VoterSetWriteInfo(
+            new OffsetAndEpoch(maxOffset, maxEpoch),
+            kraftVersion,
+            latestVoterSet
+        );
+    }
+
+    /**
+     * Read information needed for VoterSet update from a snapshot file.
+     *
+     * Extracts:
+     * - Offset and epoch (from snapshot filename)
+     * - kraft.version (from KRaftVersionRecord in snapshot)
+     * - VoterSet (from VotersRecord in snapshot)
+     *
+     * @param snapshotPath Path to the snapshot file
+     * @return VoterSetWriteInfo with all information from snapshot
+     * @throws Exception if reading fails or snapshot is invalid
+     */
+    VoterSetWriteInfo readVoterSetWriteInfoFromSnapshot(Path snapshotPath) throws Exception {
         Optional<SnapshotPath> parsedSnapshot = Snapshots.parse(snapshotPath);
         if (parsedSnapshot.isEmpty()) {
-            return null;
+            throw new FormatterException("Invalid snapshot file: " + snapshotPath);
         }
 
         SnapshotPath snapshot = parsedSnapshot.get();
         Path logDir = snapshotPath.getParent();
+
+        short kraftVersion = KRAFT_VERSION_1.featureLevel(); // Default
+        VoterSet voterSet = null;
+        long lastOffset = -1;
+        int lastEpoch = 0;
 
         try (RecordsSnapshotReader<ApiMessageAndVersion> reader = RecordsSnapshotReader.of(
                 FileRawSnapshotReader.open(logDir, snapshot.snapshotId()),
@@ -694,64 +807,33 @@ public class Formatter {
 
             while (reader.hasNext()) {
                 Batch<ApiMessageAndVersion> batch = reader.next();
-                // VotersRecord is a control record, not a regular record
+
+                // Track the last offset in the snapshot
+                // For bootstrap snapshots, this will be 3 (SnapshotFooter), not 0 (from filename)
+                lastOffset = batch.lastOffset();
+                lastEpoch = batch.epoch();
+
+                // Extract control records
                 for (ControlRecord controlRecord : batch.controlRecords()) {
                     if (controlRecord.message() instanceof VotersRecord) {
-                        return VoterSet.fromVotersRecord((VotersRecord) controlRecord.message());
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Read VoterSet from metadata log segments.
-     *
-     * Searches log segments in reverse order (newest first) and stops at the first VotersRecord found.
-     *
-     * Reuses existing Kafka code:
-     * - BatchFileReader - utility for reading log segments (also used by kafka-dump-log tool)
-     * - VoterSet.fromVotersRecord() - converts VotersRecord to VoterSet
-     *
-     * @param metadataPath Path to the metadata log directory
-     * @return Latest VoterSet found in logs, or null if none found
-     * @throws Exception if reading fails
-     */
-    VoterSet readVoterSetFromMetadataLog(Path metadataPath) throws Exception {
-        VoterSet latestInSegment = null;
-
-        // Find all .log files and sort in reverse order (newest first)
-        List<Path> logFiles = new ArrayList<>();
-        try (Stream<Path> paths = Files.list(metadataPath)) {
-            paths.filter(p -> p.toString().endsWith(".log"))
-                 .sorted(Comparator.reverseOrder())
-                 .forEach(logFiles::add);
-        }
-
-        // Replay log segments from newest to oldest
-        // Scan entire newest segment to find LAST VotersRecord (in case multiple exist)
-        for (Path logFile : logFiles) {
-            try (BatchFileReader reader = new BatchFileReader.Builder()
-                    .setPath(logFile.toString())
-                    .build()) {
-
-                while (reader.hasNext()) {
-                    BatchFileReader.BatchAndType bat = reader.next();
-                    if (bat.isControl()) {  // VotersRecord is a control record
-                        for (ApiMessageAndVersion record : bat.batch().records()) {
-                            if (record.message() instanceof VotersRecord) {
-                                // Keep scanning to find the latest one in this segment
-                                latestInSegment = VoterSet.fromVotersRecord(
-                                    (VotersRecord) record.message());
-                            }
-                        }
+                        voterSet = VoterSet.fromVotersRecord((VotersRecord) controlRecord.message());
+                    } else if (controlRecord.message() instanceof KRaftVersionRecord) {
+                        kraftVersion = ((KRaftVersionRecord) controlRecord.message()).kRaftVersion();
                     }
                 }
             }
         }
 
-        // No VotersRecord found in any log segment
-        return latestInSegment;
+        if (voterSet == null) {
+            throw new FormatterException("No VotersRecord found in snapshot: " + snapshotPath);
+        }
+
+        // Use the actual last offset from the snapshot contents, not snapshot.snapshotId()
+        // For bootstrap snapshots: filename shows (0,0) but actual last offset is 3
+        return new VoterSetWriteInfo(
+            new OffsetAndEpoch(lastOffset, lastEpoch),
+            kraftVersion,
+            voterSet
+        );
     }
 }

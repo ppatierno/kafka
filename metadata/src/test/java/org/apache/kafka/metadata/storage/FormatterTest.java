@@ -39,6 +39,7 @@ import org.apache.kafka.server.common.Feature;
 import org.apache.kafka.server.common.GroupVersion;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
+import org.apache.kafka.server.common.OffsetAndEpoch;
 import org.apache.kafka.server.common.ShareVersion;
 import org.apache.kafka.server.common.StreamsVersion;
 import org.apache.kafka.server.common.TestFeatureVersion;
@@ -636,14 +637,19 @@ public class FormatterTest {
                 .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
                 .run();
 
-            // Read the persisted VoterSet
-            VoterSet persistedVoterSet = formatter.formatter.readPersistedVoterSet(testEnv.directory(0));
+            // Read VoterSetWriteInfo
+            Formatter.VoterSetWriteInfo writeInfo = formatter.formatter.readVoterSetWriteInfo(testEnv.directory(0));
 
-            assertNotNull(persistedVoterSet, "Should read VoterSet from snapshot");
-            assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
-            assertTrue(persistedVoterSet.voterIds().contains(1), "Should contain voter 1");
-            assertTrue(persistedVoterSet.voterIds().contains(2), "Should contain voter 2");
-            assertTrue(persistedVoterSet.voterIds().contains(3), "Should contain voter 3");
+            assertNotNull(writeInfo, "Should read VoterSetWriteInfo");
+            assertNotNull(writeInfo.voterSet(), "Should have VoterSet");
+            assertEquals(3, writeInfo.voterSet().voterIds().size(), "Should have 3 voters");
+            assertTrue(writeInfo.voterSet().voterIds().contains(1), "Should contain voter 1");
+            assertTrue(writeInfo.voterSet().voterIds().contains(2), "Should contain voter 2");
+            assertTrue(writeInfo.voterSet().voterIds().contains(3), "Should contain voter 3");
+            // Bootstrap snapshot contains: Header(0), KRaftVersion(1), Voters(2), Footer(3)
+            // The actual last offset is 3, not the snapshot ID (0, 0) from the filename
+            assertEquals(new OffsetAndEpoch(3, 0), writeInfo.lastOffsetAndEpoch(), "Bootstrap snapshot should have last offset 3");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersion(), "Should have kraft.version = 1");
         }
     }
 
@@ -655,7 +661,7 @@ public class FormatterTest {
 
             // Should throw exception when metadata log directory doesn't exist
             FormatterException exception = assertThrows(FormatterException.class,
-                () -> formatter.formatter.readPersistedVoterSet(testEnv.directory(0)));
+                () -> formatter.formatter.readVoterSetWriteInfo(testEnv.directory(0)));
 
             assertTrue(exception.getMessage().contains("Metadata log directory not found"),
                 "Should indicate metadata log directory not found");
@@ -691,12 +697,17 @@ public class FormatterTest {
             // Write a control batch with VotersRecord to the log file
             writeVotersRecordToLog(logFile, updatedVotersRecord, 1L);
 
-            // Read the persisted VoterSet, should find the updated one from the log
-            VoterSet persistedVoterSet = formatter.formatter.readPersistedVoterSet(testEnv.directory(0));
+            // Read VoterSetWriteInfo, should find the updated one from the log
+            Formatter.VoterSetWriteInfo writeInfo = formatter.formatter.readVoterSetWriteInfo(testEnv.directory(0));
 
             // Verify we read the updated VoterSet from the log (not the snapshot)
-            assertNotNull(persistedVoterSet, "Should read VoterSet from log");
-            assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
+            assertNotNull(writeInfo, "Should read VoterSetWriteInfo");
+            assertNotNull(writeInfo.voterSet(), "Should have VoterSet from log");
+            assertEquals(3, writeInfo.voterSet().voterIds().size(), "Should have 3 voters");
+            assertEquals(new OffsetAndEpoch(1, 1), writeInfo.lastOffsetAndEpoch(), "Should have found offset and epoch");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersion(), "Should have kraft.version = 1");
+
+            VoterSet persistedVoterSet = writeInfo.voterSet();
 
             // Use VoterSetDiff to verify only endpoints changed
             VoterSet initialVoterSet = initialVoters.toVoterSet("CONTROLLER");
@@ -746,12 +757,17 @@ public class FormatterTest {
                 .toVotersRecord(ControlRecordUtils.KRAFT_VOTERS_CURRENT_VERSION);
             writeVotersRecordToLog(logFile, secondUpdateRecord, 2L);
 
-            // Read the persisted VoterSet which should return the LAST one (secondUpdate), not the first
-            VoterSet persistedVoterSet = formatter.formatter.readPersistedVoterSet(testEnv.directory(0));
+            // Read VoterSetWriteInfo which should return the LAST one (secondUpdate), not the first
+            Formatter.VoterSetWriteInfo writeInfo = formatter.formatter.readVoterSetWriteInfo(testEnv.directory(0));
 
             // Verify we read the latest VoterSet from the log (second update, not first)
-            assertNotNull(persistedVoterSet, "Should read VoterSet from log");
-            assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
+            assertNotNull(writeInfo, "Should read VoterSetWriteInfo");
+            assertNotNull(writeInfo.voterSet(), "Should have VoterSet from log");
+            assertEquals(3, writeInfo.voterSet().voterIds().size(), "Should have 3 voters");
+            assertEquals(new OffsetAndEpoch(2, 1), writeInfo.lastOffsetAndEpoch(), "Should have found offset and epoch");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersion(), "Should have kraft.version = 1");
+
+            VoterSet persistedVoterSet = writeInfo.voterSet();
 
             // Verify the persisted VoterSet matches the second update (not the first)
             VoterSet initialVoterSet = initialVoters.toVoterSet("CONTROLLER");
