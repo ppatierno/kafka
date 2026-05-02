@@ -615,9 +615,57 @@ public class Formatter {
         printStream.println("Validation: PASSED (only endpoints changed, safe operation)");
         printStream.println();
 
-        // TODO: Create snapshot with updated VoterSet
-        printStream.println("Snapshot creation not yet implemented.");
-        printStream.println("Override validation complete.");
+        // Create snapshot with updated VoterSet at next offset
+        createSnapshotWithUpdatedVoters(logDir, writeInfo, providedVoterSet);
+    }
+
+    /**
+     * Create a snapshot with updated VoterSet at the next log offset.
+     *
+     * This method is used by --override to create a new snapshot containing
+     * the updated VotersRecord with new DNS endpoints. The snapshot is created
+     * at the NEXT offset after the current log end, allowing controllers to load
+     * the updated VoterSet on restart without requiring quorum.
+     *
+     * @param logDir The log directory containing the metadata log
+     * @param writeInfo VoterSet write information including last offset, epoch, and kraftVersion
+     * @param updatedVoterSet The new VoterSet with updated endpoints to write to the snapshot
+     * @throws Exception if snapshot creation fails
+     */
+    private void createSnapshotWithUpdatedVoters(String logDir, VoterSetWriteInfo writeInfo, VoterSet updatedVoterSet) throws Exception {
+        // Calculate next offset for the new snapshot
+        long nextOffset = writeInfo.lastOffsetAndEpoch().offset() + 1;
+        int currentEpoch = writeInfo.lastOffsetAndEpoch().epoch();
+
+        printStream.println("Creating snapshot at offset " + nextOffset +
+                           ", epoch " + currentEpoch + " with updated VotersRecord...");
+
+        // Get the metadata log directory
+        File parentDir = new File(logDir);
+        File clusterMetadataDirectory = new File(parentDir, String.format("%s-%d",
+                CLUSTER_METADATA_TOPIC_PARTITION.topic(),
+                CLUSTER_METADATA_TOPIC_PARTITION.partition()));
+
+        // Create snapshot at next offset with updated VoterSet
+        OffsetAndEpoch snapshotId = new OffsetAndEpoch(nextOffset, currentEpoch);
+        RecordsSnapshotWriter.Builder builder = new RecordsSnapshotWriter.Builder()
+            .setLastContainedLogTimestamp(Time.SYSTEM.milliseconds())
+            .setMaxBatchSizeBytes(KafkaRaftClient.MAX_BATCH_SIZE_BYTES)
+            .setRawSnapshotWriter(FileRawSnapshotWriter.create(
+                clusterMetadataDirectory.toPath(),
+                snapshotId))
+            .setKraftVersion(KRaftVersion.fromFeatureLevel(writeInfo.kraftVersion()))
+            .setVoterSet(Optional.of(updatedVoterSet));
+
+        try (RecordsSnapshotWriter<ApiMessageAndVersion> writer = builder.build(new MetadataRecordSerde())) {
+            writer.freeze();
+        }
+
+        // Log snapshot creation details for operators
+        String snapshotFilename = String.format("%020d-%010d.checkpoint", nextOffset, currentEpoch);
+        printStream.println("Snapshot created: " + snapshotFilename);
+        printStream.println();
+        printStream.println("Override complete. Kafka will load updated VoterSet on startup.");
     }
 
     /**
