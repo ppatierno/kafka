@@ -21,7 +21,7 @@ import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.message.KRaftVersionRecord;
 import org.apache.kafka.common.message.VotersRecord;
 import org.apache.kafka.common.utils.internals.BufferSupplier;
-import org.apache.kafka.common.utils.LogContext;
+import org.apache.kafka.common.utils.internals.LogContext;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.metadata.MetadataRecordSerde;
 import org.apache.kafka.metadata.bootstrap.BootstrapDirectory;
@@ -554,8 +554,7 @@ public class Formatter {
     /**
      * Handle --override mode: update VoterSet if needed.
      *
-     * This method provides idempotent, safe VoterSet updates for cloud-native environments
-     * where kafka-storage.sh runs on every pod start (e.g., Strimzi).
+     * This method allows to override the VoterSet in case of endpoints change (DNS/port) within the current KRaft quorum.
      *
      * Safety guarantees:
      * - Only allows endpoint (DNS/port) changes
