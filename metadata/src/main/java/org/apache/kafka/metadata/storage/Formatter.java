@@ -271,9 +271,12 @@ public class Formatter {
         if (controllerListenerName == null) {
             throw new FormatterException("You must specify the name of the initial controller listener.");
         }
-        // Validate override requires initial-controllers (Formatter-level check)
-        if (override && initialControllers.isEmpty()) {
-            throw new FormatterException("--override requires --initial-controllers to specify the new voter endpoints.");
+        // Validate override requires dynamic quorum mode with initial-controllers
+        if (override && (!hasDynamicQuorum() || initialControllers.isEmpty())) {
+            throw new FormatterException(
+                "The --override flag requires dynamic quorum mode. " +
+                "Use --initial-controllers to specify the voter endpoints."
+            );
         }
         metadataLogDirectory.ifPresent(d -> {
             if (!directories.contains(d)) {

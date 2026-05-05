@@ -618,9 +618,24 @@ public class FormatterTest {
             formatter.formatter.setOverride(true);
 
             assertEquals(
-                "--override requires --initial-controllers to specify the new voter endpoints.",
+                "The --override flag requires dynamic quorum mode. " +
+                "Use --initial-controllers to specify the voter endpoints.",
                 assertThrows(FormatterException.class, formatter.formatter::run).getMessage()
             );
+        }
+    }
+
+    @Test
+    public void testOverrideRequiresDynamicQuorum() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Try to use override without dynamic quorum (static quorum mode)
+            FormatterContext formatter = testEnv.newFormatter();
+            formatter.formatter
+                .setOverride(true)
+                .setHasDynamicQuorum(false);  // Explicitly set to static quorum
+
+            FormatterException exception = assertThrows(FormatterException.class, formatter.formatter::run);
+            assertTrue(exception.getMessage().contains("requires dynamic quorum mode"), "Should reject override in static quorum mode");
         }
     }
 
