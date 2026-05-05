@@ -41,6 +41,7 @@ import org.apache.kafka.server.common.FeatureVersion;
 import org.apache.kafka.server.common.KRaftVersion;
 import org.apache.kafka.server.common.MetadataVersion;
 import org.apache.kafka.server.common.OffsetAndEpoch;
+import org.apache.kafka.server.util.FileLock;
 import org.apache.kafka.snapshot.FileRawSnapshotReader;
 import org.apache.kafka.snapshot.FileRawSnapshotWriter;
 import org.apache.kafka.snapshot.RecordsSnapshotReader;
@@ -561,61 +562,84 @@ public class Formatter {
      * - Rejects voter ID changes (topology changes)
      * - Rejects directory ID changes (prevents data loss)
      * - Idempotent: safe to run multiple times
+     * - Acquires lock file to prevent concurrent Kafka access
      *
      * @param writeLogDir The log directory containing the metadata log
      * @throws FormatterException if changes are unsafe or validation fails
      */
     private void handleOverride(String writeLogDir) throws Exception {
-        printStream.println("Storage directory " + writeLogDir + " is already formatted.");
-        printStream.println("Override mode enabled, checking if VoterSet needs updating...");
-        printStream.println();
+        // Get metadata directory path
+        File parentDir = new File(writeLogDir);
+        File clusterMetadataDirectory = new File(parentDir, String.format("%s-%d",
+                CLUSTER_METADATA_TOPIC_PARTITION.topic(),
+                CLUSTER_METADATA_TOPIC_PARTITION.partition()));
 
-        // Read persisted state from metadata log or snapshot
-        VoterSetWriteInfo writeInfo = readVoterSetWriteInfo(writeLogDir);
-        printStream.println("VoterSetWriteInfo:");
-        printStream.println(writeInfo);
-        printStream.println();
+        // Acquire lock file to prevent concurrent Kafka access
+        File lockFile = new File(clusterMetadataDirectory, ".lock");
+        FileLock fileLock = new FileLock(lockFile);
 
-        VoterSet persistedVoterSet = writeInfo.voterSet();
-        printStream.println("Persisted VoterSet:");
-        printStream.println(persistedVoterSet);
-        printStream.println();
+        try {
+            if (!fileLock.tryLock()) {
+                throw new FormatterException(
+                    "Failed to acquire lock on file .lock in " + lockFile.getParent() + ". " +
+                    "A Kafka instance in another process or thread is using this directory."
+                );
+            }
 
-        // Get provided VoterSet from --initial-controllers
-        if (initialControllers.isEmpty()) {
-            throw new FormatterException("--override requires --initial-controllers to specify the new voter endpoints.");
+            printStream.println("Storage directory " + writeLogDir + " is already formatted.");
+            printStream.println("Override mode enabled, checking if VoterSet needs updating...");
+            printStream.println();
+
+            // Read persisted state from metadata log or snapshot
+            VoterSetWriteInfo writeInfo = readVoterSetWriteInfo(writeLogDir);
+            printStream.println("VoterSetWriteInfo:");
+            printStream.println(writeInfo);
+            printStream.println();
+
+            VoterSet persistedVoterSet = writeInfo.voterSet();
+            printStream.println("Persisted VoterSet:");
+            printStream.println(persistedVoterSet);
+            printStream.println();
+
+            // Get provided VoterSet from --initial-controllers
+            if (initialControllers.isEmpty()) {
+                throw new FormatterException("--override requires --initial-controllers to specify the new voter endpoints.");
+            }
+            VoterSet providedVoterSet = initialControllers.get().toVoterSet(controllerListenerName);
+            printStream.println("Provided VoterSet (from --initial-controllers):");
+            printStream.println(providedVoterSet);
+            printStream.println();
+
+            // Detect changes using VoterSetDiff (compares hostname/port only, ignoring resolved IPs)
+            VoterSetDiff diff = VoterSetDiff.compare(persistedVoterSet, providedVoterSet, controllerListenerName);
+
+            // Idempotence check: if no changes detected, skip override
+            if (!diff.hasVoterIdChanges() && !diff.hasDirectoryIdChanges() && diff.endpointChanges().isEmpty()) {
+                printStream.println("No changes detected (VoterSets are equivalent). Override operation skipped, already up to date.");
+                return;
+            }
+
+            printStream.println("Changes detected:");
+            printStream.println(diff);
+            printStream.println();
+
+            // Validate safety: only endpoint changes allowed
+            if (!diff.onlyEndpointsChanged()) {
+                throw new FormatterException(
+                    "--override cannot be used for changing node IDs or directory IDs.\n" +
+                    "Changes detected:\n" + diff
+                );
+            }
+
+            printStream.println("Validation: PASSED (only endpoints changed, safe operation)");
+            printStream.println();
+
+            // Create snapshot with updated VoterSet at next offset
+            createSnapshotWithUpdatedVoters(writeLogDir, writeInfo, initialControllers);
+        } finally {
+            // Always release the lock
+            fileLock.unlockAndClose();
         }
-        VoterSet providedVoterSet = initialControllers.get().toVoterSet(controllerListenerName);
-        printStream.println("Provided VoterSet (from --initial-controllers):");
-        printStream.println(providedVoterSet);
-        printStream.println();
-
-        // Detect changes using VoterSetDiff (compares hostname/port only, ignoring resolved IPs)
-        VoterSetDiff diff = VoterSetDiff.compare(persistedVoterSet, providedVoterSet, controllerListenerName);
-
-        // Idempotence check: if no changes detected, skip override
-        if (!diff.hasVoterIdChanges() && !diff.hasDirectoryIdChanges() && diff.endpointChanges().isEmpty()) {
-            printStream.println("No changes detected (VoterSets are equivalent). Override operation skipped, already up to date.");
-            return;
-        }
-
-        printStream.println("Changes detected:");
-        printStream.println(diff);
-        printStream.println();
-
-        // Validate safety: only endpoint changes allowed
-        if (!diff.onlyEndpointsChanged()) {
-            throw new FormatterException(
-                "--override cannot be used for changing node IDs or directory IDs.\n" +
-                "Changes detected:\n" + diff
-            );
-        }
-
-        printStream.println("Validation: PASSED (only endpoints changed, safe operation)");
-        printStream.println();
-
-        // Create snapshot with updated VoterSet at next offset
-        createSnapshotWithUpdatedVoters(writeLogDir, writeInfo, initialControllers);
     }
 
     /**

@@ -44,6 +44,7 @@ import org.apache.kafka.server.common.ShareVersion;
 import org.apache.kafka.server.common.StreamsVersion;
 import org.apache.kafka.server.common.TestFeatureVersion;
 import org.apache.kafka.server.common.TransactionVersion;
+import org.apache.kafka.server.util.FileLock;
 import org.apache.kafka.test.TestUtils;
 
 import org.junit.jupiter.api.Test;
@@ -951,6 +952,98 @@ public class FormatterTest {
                 () -> formatter2.formatter.run());
             assertTrue(exception.getMessage().contains("--override cannot be used for changing node IDs or directory IDs."),
                 "Should reject directory ID changes");
+        }
+    }
+
+    @Test
+    public void testOverrideLockPreventsSimultaneousAccess() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Step 1: Format storage with initial voters
+            DynamicVoters initialVoters = DynamicVoters.parse("1@localhost:9093:4znU-ou9Taa06bmEJxsjnw");
+            FormatterContext formatter1 = testEnv.newFormatter();
+            formatter1.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(initialVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            // Step 2: Acquire lock manually to simulate Kafka running
+            File metadataDir = new File(testEnv.directories.get(0), "__cluster_metadata-0");
+            File lockFile = new File(metadataDir, ".lock");
+            FileLock heldLock = new FileLock(lockFile);
+            heldLock.lock();
+
+            try {
+                // Step 3: Try to run override while lock is held
+                DynamicVoters newVoters = DynamicVoters.parse("1@localhost-new:9093:4znU-ou9Taa06bmEJxsjnw");
+                FormatterContext formatter2 = testEnv.newFormatter();
+                formatter2.formatter
+                    .setUnstableFeatureVersionsEnabled(true)
+                    .setInitialControllers(newVoters)
+                    .setHasDynamicQuorum(true)
+                    .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                    .setOverride(true);
+
+                // Should throw exception because lock is held
+                FormatterException exception = assertThrows(FormatterException.class, () -> formatter2.formatter.run());
+                assertTrue(exception.getMessage().contains("Failed to acquire lock"), "Should reject override when lock is held");
+                assertTrue(exception.getMessage().contains("A Kafka instance in another process"), "Should mention Kafka might be running");
+            } finally {
+                heldLock.unlockAndClose();
+            }
+        }
+    }
+
+    @Test
+    public void testOverrideLockReleasedOnError() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Step 1: Format storage with initial voters and directory ID
+            DynamicVoters initialVoters = DynamicVoters.parse("1@localhost:9093:4znU-ou9Taa06bmEJxsjnw");
+            FormatterContext formatter1 = testEnv.newFormatter();
+            formatter1.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(initialVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            // Step 2: Try to override with INVALID change (directory ID change)
+            // This should fail validation and throw FormatterException
+            DynamicVoters invalidVoters = DynamicVoters.parse("1@localhost-new:9093:5znU-ou9Taa06bmEJxsjnx");
+            FormatterContext formatter2 = testEnv.newFormatter();
+            formatter2.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(invalidVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .setOverride(true);
+
+            // Should throw exception due to directory ID change
+            FormatterException exception = assertThrows(FormatterException.class, () -> formatter2.formatter.run());
+            assertTrue(exception.getMessage().contains("--override cannot be used for changing node IDs or directory IDs"), "Should reject directory ID changes");
+
+            // Step 3: Verify lock was released by successfully acquiring it
+            File metadataDir = new File(testEnv.directories.get(0), "__cluster_metadata-0");
+            File lockFile = new File(metadataDir, ".lock");
+            FileLock testLock = new FileLock(lockFile);
+
+            // This should succeed if lock was properly released in finally block
+            assertTrue(testLock.tryLock(), "Lock should be available after failed override operation (lock was not leaked)");
+            testLock.unlockAndClose();
+
+            // Step 4: Verify we can retry with valid changes after the error
+            DynamicVoters validVoters = DynamicVoters.parse("1@localhost-new:9093:4znU-ou9Taa06bmEJxsjnw");
+            FormatterContext formatter3 = testEnv.newFormatter();
+            formatter3.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(validVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .setOverride(true);
+
+            // Should succeed now - proves lock was released and retry works
+            assertDoesNotThrow(() -> formatter3.formatter.run(), "Should be able to retry override after previous error");
         }
     }
 
