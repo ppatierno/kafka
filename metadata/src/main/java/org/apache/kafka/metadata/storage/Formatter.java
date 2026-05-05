@@ -562,16 +562,16 @@ public class Formatter {
      * - Rejects directory ID changes (prevents data loss)
      * - Idempotent: safe to run multiple times
      *
-     * @param logDir The log directory containing the metadata log
+     * @param writeLogDir The log directory containing the metadata log
      * @throws FormatterException if changes are unsafe or validation fails
      */
-    private void handleOverride(String logDir) throws Exception {
-        printStream.println("Storage directory " + logDir + " is already formatted.");
+    private void handleOverride(String writeLogDir) throws Exception {
+        printStream.println("Storage directory " + writeLogDir + " is already formatted.");
         printStream.println("Override mode enabled, checking if VoterSet needs updating...");
         printStream.println();
 
         // Read persisted state from metadata log or snapshot
-        VoterSetWriteInfo writeInfo = readVoterSetWriteInfo(logDir);
+        VoterSetWriteInfo writeInfo = readVoterSetWriteInfo(writeLogDir);
         printStream.println("VoterSetWriteInfo:");
         printStream.println(writeInfo);
         printStream.println();
@@ -615,7 +615,7 @@ public class Formatter {
         printStream.println();
 
         // Create snapshot with updated VoterSet at next offset
-        createSnapshotWithUpdatedVoters(logDir, writeInfo, providedVoterSet);
+        createSnapshotWithUpdatedVoters(writeLogDir, writeInfo, initialControllers);
     }
 
     /**
@@ -626,12 +626,11 @@ public class Formatter {
      * at the NEXT offset after the current log end, allowing controllers to load
      * the updated VoterSet on restart without requiring quorum.
      *
-     * @param logDir The log directory containing the metadata log
+     * @param writeLogDir The log directory containing the metadata log
      * @param writeInfo VoterSet write information including last offset, epoch, and kraftVersion
-     * @param updatedVoterSet The new VoterSet with updated endpoints to write to the snapshot
-     * @throws Exception if snapshot creation fails
+     * @param initialControllers The new initial controllers with updated endpoints to write to the snapshot
      */
-    private void createSnapshotWithUpdatedVoters(String logDir, VoterSetWriteInfo writeInfo, VoterSet updatedVoterSet) throws Exception {
+    private void createSnapshotWithUpdatedVoters(String writeLogDir, VoterSetWriteInfo writeInfo, Optional<DynamicVoters> initialControllers) {
         // Calculate next offset for the new snapshot
         long nextOffset = writeInfo.lastOffsetAndEpoch().offset() + 1;
         int currentEpoch = writeInfo.lastOffsetAndEpoch().epoch();
@@ -639,26 +638,14 @@ public class Formatter {
         printStream.println("Creating snapshot at offset " + nextOffset +
                            ", epoch " + currentEpoch + " with updated VotersRecord...");
 
-        // Get the metadata log directory
-        File parentDir = new File(logDir);
-        File clusterMetadataDirectory = new File(parentDir, String.format("%s-%d",
-                CLUSTER_METADATA_TOPIC_PARTITION.topic(),
-                CLUSTER_METADATA_TOPIC_PARTITION.partition()));
-
-        // Create snapshot at next offset with updated VoterSet
         OffsetAndEpoch snapshotId = new OffsetAndEpoch(nextOffset, currentEpoch);
-        RecordsSnapshotWriter.Builder builder = new RecordsSnapshotWriter.Builder()
-            .setLastContainedLogTimestamp(Time.SYSTEM.milliseconds())
-            .setMaxBatchSizeBytes(KafkaRaftClient.MAX_BATCH_SIZE_BYTES)
-            .setRawSnapshotWriter(FileRawSnapshotWriter.create(
-                clusterMetadataDirectory.toPath(),
-                snapshotId))
-            .setKraftVersion(KRaftVersion.fromFeatureLevel(writeInfo.kraftVersion()))
-            .setVoterSet(Optional.of(updatedVoterSet));
-
-        try (RecordsSnapshotWriter<ApiMessageAndVersion> writer = builder.build(new MetadataRecordSerde())) {
-            writer.freeze();
-        }
+        writeDynamicQuorumSnapshot(
+            writeLogDir,
+            initialControllers.get(),
+            writeInfo.kraftVersion(),
+            controllerListenerName,
+            snapshotId
+        );
 
         // Log snapshot creation details for operators
         String snapshotFilename = String.format("%020d-%010d.checkpoint", nextOffset, currentEpoch);
