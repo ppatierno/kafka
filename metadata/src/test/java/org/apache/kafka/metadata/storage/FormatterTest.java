@@ -1062,6 +1062,185 @@ public class FormatterTest {
         }
     }
 
+    @Test
+    public void testBuildMetadataImageFromSnapshot() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Format with dynamic quorum (creates snapshot with VotersRecord)
+            DynamicVoters voters = DynamicVoters.parse("1@localhost:9093:4znU-ou9Taa06bmEJxsjnw,2@localhost:9094:5znU-ou9Taa06bmEJxsjnx,3@localhost:9095:6znU-ou9Taa06bmEJxsjny");
+
+            FormatterContext formatter = testEnv.newFormatter();
+            formatter.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(voters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            // Build complete metadata
+            Formatter.LoadedMetadata loaded = formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0));
+
+            // Verify VoterSet loaded
+            assertNotNull(loaded, "Should load metadata");
+            assertNotNull(loaded.voterSet(), "Should have VoterSet");
+            assertEquals(3, loaded.voterSet().voterIds().size(), "Should have 3 voters");
+            assertTrue(loaded.voterSet().voterIds().contains(1), "Should contain voter 1");
+            assertTrue(loaded.voterSet().voterIds().contains(2), "Should contain voter 2");
+            assertTrue(loaded.voterSet().voterIds().contains(3), "Should contain voter 3");
+
+            // Verify offset/epoch
+            assertEquals(new OffsetAndEpoch(3, 0), loaded.lastOffsetAndEpoch(), "Bootstrap snapshot should have last offset 3");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), loaded.kraftVersion(), "Should have kraft.version = 1");
+
+            // Verify MetadataImage loaded (features, topics, etc.)
+            assertNotNull(loaded.image(), "Should have MetadataImage");
+            assertNotNull(loaded.image().features(), "Should have features");
+            assertNotNull(loaded.image().features().metadataVersion(), "Should have metadata.version");
+        }
+    }
+
+    @Test
+    public void testBuildMetadataImageWithNoMetadata() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Create a directory without formatting it (no metadata)
+            FormatterContext formatter = testEnv.newFormatter();
+
+            // Should throw exception when metadata log directory doesn't exist
+            FormatterException exception = assertThrows(FormatterException.class,
+                () -> formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0)));
+
+            assertTrue(exception.getMessage().contains("Metadata log directory not found"),
+                "Should indicate metadata log directory not found");
+        }
+    }
+
+    @Test
+    @Timeout(40000)
+    public void testBuildMetadataImageFromLogs() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Format with initial VoterSet
+            DynamicVoters initialVoters = DynamicVoters.parse(
+                "1@localhost:9093:4znU-ou9Taa06bmEJxsjnw,2@localhost:9094:5znU-ou9Taa06bmEJxsjnx,3@localhost:9095:6znU-ou9Taa06bmEJxsjny");
+
+            FormatterContext formatter = testEnv.newFormatter();
+            formatter.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(initialVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            // Write updated VotersRecord to log (simulating DNS change)
+            DynamicVoters updatedVoters = DynamicVoters.parse(
+                "1@localhost:9096:4znU-ou9Taa06bmEJxsjnw,2@localhost:9097:5znU-ou9Taa06bmEJxsjnx,3@localhost:9098:6znU-ou9Taa06bmEJxsjny");
+            VotersRecord updatedVotersRecord = updatedVoters.toVoterSet("CONTROLLER")
+                .toVotersRecord(ControlRecordUtils.KRAFT_VOTERS_CURRENT_VERSION);
+
+            Path metadataLogPath = Paths.get(testEnv.directory(0), "__cluster_metadata-0");
+            Path logFile = metadataLogPath.resolve("00000000000000000000.log");
+            writeVotersRecordToLog(logFile, updatedVotersRecord, 4L);
+
+            // Build metadata - should pick up VoterSet from log
+            Formatter.LoadedMetadata loaded = formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0));
+
+            // Verify VoterSet from log was loaded (not from snapshot)
+            assertNotNull(loaded.voterSet(), "Should have VoterSet");
+            assertEquals(3, loaded.voterSet().voterIds().size(), "Should have 3 voters");
+            assertTrue(loaded.voterSet().voterIds().contains(1), "Should contain voter 1");
+
+            // Verify offset includes log
+            assertEquals(4L, loaded.lastOffsetAndEpoch().offset(), "Should have last offset from log");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), loaded.kraftVersion(), "Should have kraft.version = 1");
+
+            VoterSet persistedVoterSet = loaded.voterSet();
+
+            // Use VoterSetDiff to verify only endpoints changed
+            VoterSet initialVoterSet = initialVoters.toVoterSet("CONTROLLER");
+            VoterSet updatedVoterSet = updatedVoters.toVoterSet("CONTROLLER");
+            VoterSetDiff diff = VoterSetDiff.compare(initialVoterSet, updatedVoterSet, "CONTROLLER");
+
+            assertTrue(diff.onlyEndpointsChanged(), "Should only have endpoint changes");
+            assertFalse(diff.hasVoterIdChanges(), "Should not have voter ID changes");
+            assertFalse(diff.hasDirectoryIdChanges(), "Should not have directory ID changes");
+            assertEquals(3, diff.endpointChanges().size(), "All 3 endpoints should change");
+
+            // Verify the persisted VoterSet matches the updated one
+            assertEquals(updatedVoterSet.voterIds(), persistedVoterSet.voterIds(), "VoterSet IDs should match");
+
+            // Verify MetadataImage loaded
+            assertNotNull(loaded.image(), "Should have MetadataImage");
+            assertNotNull(loaded.image().features(), "Should have features");
+        }
+    }
+
+    @Test
+    public void testBuildMetadataImageFromLogsWithMultipleUpdates() throws Exception {
+        try (TestEnv testEnv = new TestEnv(1)) {
+            // Format with initial VoterSet (creates snapshot)
+            DynamicVoters initialVoters = DynamicVoters.parse(
+                "1@localhost:9093:4znU-ou9Taa06bmEJxsjnw,2@localhost:9094:5znU-ou9Taa06bmEJxsjnx,3@localhost:9095:6znU-ou9Taa06bmEJxsjny");
+
+            FormatterContext formatter = testEnv.newFormatter();
+            formatter.formatter
+                .setUnstableFeatureVersionsEnabled(true)
+                .setInitialControllers(initialVoters)
+                .setHasDynamicQuorum(true)
+                .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
+                .run();
+
+            Path metadataLogPath = Paths.get(testEnv.directory(0), "__cluster_metadata-0");
+            Path logFile = metadataLogPath.resolve("00000000000000000000.log");
+
+            // Write multiple VotersRecords to log (simulating multiple DNS changes)
+            // First update
+            DynamicVoters firstUpdate = DynamicVoters.parse(
+                "1@localhost:9096:4znU-ou9Taa06bmEJxsjnw,2@localhost:9097:5znU-ou9Taa06bmEJxsjnx,3@localhost:9098:6znU-ou9Taa06bmEJxsjny");
+            VotersRecord firstUpdateRecord = firstUpdate.toVoterSet("CONTROLLER")
+                .toVotersRecord(ControlRecordUtils.KRAFT_VOTERS_CURRENT_VERSION);
+            writeVotersRecordToLog(logFile, firstUpdateRecord, 4L);
+
+            // Second update (this is the latest and should be returned)
+            DynamicVoters secondUpdate = DynamicVoters.parse(
+                "1@localhost:9099:4znU-ou9Taa06bmEJxsjnw,2@localhost:9100:5znU-ou9Taa06bmEJxsjnx,3@localhost:9101:6znU-ou9Taa06bmEJxsjny");
+            VotersRecord secondUpdateRecord = secondUpdate.toVoterSet("CONTROLLER")
+                .toVotersRecord(ControlRecordUtils.KRAFT_VOTERS_CURRENT_VERSION);
+            writeVotersRecordToLog(logFile, secondUpdateRecord, 5L);
+
+            // Build metadata - should pick up the LATEST VoterSet from log
+            Formatter.LoadedMetadata loaded = formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0));
+
+            // Verify we got the latest VoterSet (second update, not first)
+            assertNotNull(loaded.voterSet(), "Should have VoterSet");
+            assertEquals(3, loaded.voterSet().voterIds().size(), "Should have 3 voters");
+
+            // Verify offset is from the last update
+            assertEquals(5L, loaded.lastOffsetAndEpoch().offset(), "Should have last offset from second update");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), loaded.kraftVersion(), "Should have kraft.version = 1");
+
+            VoterSet persistedVoterSet = loaded.voterSet();
+
+            // Verify the persisted VoterSet matches the second update (not the first)
+            VoterSet initialVoterSet = initialVoters.toVoterSet("CONTROLLER");
+            VoterSet secondVoterSet = secondUpdate.toVoterSet("CONTROLLER");
+
+            // Compare initial with second to verify only endpoints changed
+            VoterSetDiff diff = VoterSetDiff.compare(initialVoterSet, secondVoterSet, "CONTROLLER");
+            assertTrue(diff.onlyEndpointsChanged(), "Should only have endpoint changes from initial to second");
+            assertFalse(diff.hasVoterIdChanges(), "Should not have voter ID changes");
+            assertFalse(diff.hasDirectoryIdChanges(), "Should not have directory ID changes");
+            assertEquals(3, diff.endpointChanges().size(), "All 3 endpoints should change");
+
+            // Verify the persisted VoterSet matches the second update (using VoterSetDiff to handle resolved IPs)
+            VoterSetDiff persistedDiff = VoterSetDiff.compare(secondVoterSet, persistedVoterSet, "CONTROLLER");
+            assertFalse(persistedDiff.hasVoterIdChanges(), "Persisted should have same voter IDs as second update");
+            assertFalse(persistedDiff.hasDirectoryIdChanges(), "Persisted should have same directory IDs as second update");
+            assertTrue(persistedDiff.endpointChanges().isEmpty(), "Persisted should have same endpoints as second update");
+
+            // Verify MetadataImage loaded
+            assertNotNull(loaded.image(), "Should have MetadataImage");
+            assertNotNull(loaded.image().features(), "Should have features");
+        }
+    }
+
     /**
      * Writes a VotersRecord as a control record to a log file.
      * Uses MemoryRecords.withVotersRecord() factory method (similar to RecordsIteratorTest.buildControlRecords).

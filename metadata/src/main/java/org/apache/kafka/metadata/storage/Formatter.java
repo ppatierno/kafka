@@ -30,6 +30,10 @@ import org.apache.kafka.metadata.properties.MetaProperties;
 import org.apache.kafka.metadata.properties.MetaPropertiesEnsemble;
 import org.apache.kafka.metadata.properties.MetaPropertiesVersion;
 import org.apache.kafka.metadata.util.BatchFileReader;
+import org.apache.kafka.image.MetadataDelta;
+import org.apache.kafka.image.MetadataImage;
+import org.apache.kafka.image.MetadataProvenance;
+import org.apache.kafka.common.record.internal.ControlRecordType;
 import org.apache.kafka.raft.Batch;
 import org.apache.kafka.raft.ControlRecord;
 import org.apache.kafka.raft.DynamicVoters;
@@ -682,6 +686,239 @@ public class Formatter {
     }
 
     /**
+     * Complete metadata state loaded from snapshot + logs.
+     *
+     * @param image Complete metadata image (features, topics, configs, ACLs, etc.)
+     * @param voterSet Current VoterSet from control records
+     * @param lastOffsetAndEpoch Last offset and epoch in the metadata log/snapshot
+     * @param kraftVersion kraft.version from control records
+     */
+    record LoadedMetadata(MetadataImage image, VoterSet voterSet, OffsetAndEpoch lastOffsetAndEpoch, short kraftVersion) { }
+
+    /**
+     * Internal helper record for loadSnapshotIntoDelta() and loadLogsIntoDelta().
+     */
+    record MetadataLoadInfo(OffsetAndEpoch offsetAndEpoch, short kraftVersion, VoterSet voterSet) { }
+
+    /**
+     * Build complete MetadataImage from metadata directory (snapshot + logs).
+     *
+     * This method:
+     * 1. Loads the latest snapshot (if exists) and replays all records into MetadataDelta
+     * 2. Replays all log records from the snapshot's end offset
+     * 3. Returns a complete MetadataImage containing ALL cluster metadata
+     *
+     * @param logDir The log directory containing the metadata log
+     * @return LoadedMetadata with complete MetadataImage and offset/epoch information
+     * @throws Exception if reading fails or no data found
+     */
+    LoadedMetadata buildMetadataImageFromDirectory(String logDir) throws Exception {
+        Path metadataPath = Paths.get(logDir, String.format("%s-%d",
+            CLUSTER_METADATA_TOPIC_PARTITION.topic(),
+            CLUSTER_METADATA_TOPIC_PARTITION.partition()));
+
+        if (!Files.exists(metadataPath)) {
+            throw new FormatterException("Metadata log directory not found: " + metadataPath +
+                ". The directory may not be formatted with dynamic quorum mode.");
+        }
+
+        MetadataDelta delta = new MetadataDelta.Builder()
+            .setImage(MetadataImage.EMPTY)
+            .build();
+
+        OffsetAndEpoch offsetAndEpoch = new OffsetAndEpoch(-1, 0);
+        short kraftVersion = KRAFT_VERSION_1.featureLevel();
+        VoterSet voterSet = null;
+
+        // 1. Load snapshot (if exists)
+        MetadataLoadInfo snapshotInfo = loadSnapshotIntoDelta(metadataPath, delta);
+        if (snapshotInfo != null) {
+            offsetAndEpoch = snapshotInfo.offsetAndEpoch();
+            kraftVersion = snapshotInfo.kraftVersion();
+            voterSet = snapshotInfo.voterSet();
+        }
+
+        // 2. Replay logs from where snapshot left off
+        MetadataLoadInfo logInfo = loadLogsIntoDelta(metadataPath, delta, offsetAndEpoch.offset() + 1);
+        if (logInfo != null) {
+            offsetAndEpoch = logInfo.offsetAndEpoch();
+            if (logInfo.kraftVersion() > 0) {
+                kraftVersion = logInfo.kraftVersion();
+            }
+            // VoterSet from log takes precedence over snapshot
+            if (logInfo.voterSet() != null) {
+                voterSet = logInfo.voterSet();
+            }
+        }
+
+        if (offsetAndEpoch.offset() < 0) {
+            throw new FormatterException("No metadata found in " + metadataPath +
+                ". The directory may not be formatted with dynamic quorum mode.");
+        }
+
+        if (voterSet == null) {
+            throw new FormatterException("No VotersRecord found in " + metadataPath +
+                ". The directory may not be formatted with dynamic quorum mode.");
+        }
+
+        MetadataProvenance provenance = new MetadataProvenance(
+            offsetAndEpoch.offset(),
+            offsetAndEpoch.epoch(),
+            Time.SYSTEM.milliseconds(),
+            false  // Not from snapshot alone, but from snapshot + logs
+        );
+        MetadataImage image = delta.apply(provenance);
+        return new LoadedMetadata(image, voterSet, offsetAndEpoch, kraftVersion);
+    }
+
+    /**
+     * Load snapshot into MetadataDelta by replaying ALL records.
+     * Follows MetadataLoader.loadSnapshot() pattern.
+     *
+     * @param metadataPath Path to the metadata log directory
+     * @param delta MetadataDelta to replay records into
+     * @return MetadataLoadInfo with offset, epoch, and kraftVersion, or null if no snapshot exists
+     * @throws Exception if reading fails or snapshot is invalid
+     */
+    private MetadataLoadInfo loadSnapshotIntoDelta(Path metadataPath, MetadataDelta delta) throws Exception {
+        if (!Files.exists(metadataPath)) {
+            return null;
+        }
+
+        // Find latest snapshot in directory
+        List<Path> snapshots = new ArrayList<>();
+        try (Stream<Path> paths = Files.list(metadataPath)) {
+            paths.filter(p -> p.toString().endsWith(".checkpoint"))
+                 .sorted(Comparator.reverseOrder())  // Newest first
+                 .forEach(snapshots::add);
+        }
+
+        if (snapshots.isEmpty()) {
+            return null;
+        }
+
+        Path snapshotPath = snapshots.get(0);
+        Optional<SnapshotPath> parsedSnapshot = Snapshots.parse(snapshotPath);
+        if (parsedSnapshot.isEmpty()) {
+            throw new FormatterException("Invalid snapshot file: " + snapshotPath);
+        }
+
+        SnapshotPath snapshot = parsedSnapshot.get();
+
+        short kraftVersion = KRAFT_VERSION_1.featureLevel();
+        VoterSet voterSet = null;
+        long lastOffset = -1;
+        int lastEpoch = 0;
+
+        try (RecordsSnapshotReader<ApiMessageAndVersion> reader = RecordsSnapshotReader.of(
+                FileRawSnapshotReader.open(metadataPath, snapshot.snapshotId()),
+                new MetadataRecordSerde(),
+                BufferSupplier.create(),
+                Integer.MAX_VALUE,
+                true,
+                new LogContext())) {
+
+            // Follow MetadataLoader.loadSnapshot() pattern
+            while (reader.hasNext()) {
+                Batch<ApiMessageAndVersion> batch = reader.next();
+
+                // Track the last offset in the snapshot
+                lastOffset = batch.lastOffset();
+                lastEpoch = batch.epoch();
+
+                // Extract control records (VoterSet and KRaftVersion)
+                for (ControlRecord controlRecord : batch.controlRecords()) {
+                    if (controlRecord.type() == ControlRecordType.KRAFT_VOTERS) {
+                        voterSet = VoterSet.fromVotersRecord((VotersRecord) controlRecord.message());
+                    } else if (controlRecord.type() == ControlRecordType.KRAFT_VERSION) {
+                        KRaftVersionRecord rec = (KRaftVersionRecord) controlRecord.message();
+                        kraftVersion = rec.kRaftVersion();
+                    }
+                }
+
+                // Replay ALL metadata records (not control records!)
+                for (ApiMessageAndVersion record : batch.records()) {
+                    delta.replay(record.message());
+                }
+            }
+            delta.finishSnapshot();
+
+            return new MetadataLoadInfo(new OffsetAndEpoch(lastOffset, lastEpoch), kraftVersion, voterSet);
+        }
+    }
+
+    /**
+     * Replay log segments into MetadataDelta.
+     * Reuses file reading logic but replays all records instead of just extracting VotersRecord.
+     *
+     * @param metadataPath Path to the metadata log directory
+     * @param delta MetadataDelta to replay records into
+     * @param fromOffset Starting offset (exclusive) - only replay records after this offset
+     * @return MetadataLoadInfo with last offset/epoch/kraftVersion, or null if no logs found
+     * @throws Exception if reading fails
+     */
+    private MetadataLoadInfo loadLogsIntoDelta(Path metadataPath, MetadataDelta delta, long fromOffset) throws Exception {
+        if (!Files.exists(metadataPath)) {
+            return null;
+        }
+
+        // Find all .log segment files
+        List<Path> logSegments = new ArrayList<>();
+        try (Stream<Path> paths = Files.list(metadataPath)) {
+            paths.filter(p -> p.toString().endsWith(".log"))
+                 .sorted()  // Process in order
+                 .forEach(logSegments::add);
+        }
+
+        if (logSegments.isEmpty()) {
+            return null;
+        }
+
+        long lastOffset = -1;
+        int lastEpoch = 0;
+        short kraftVersion = 0;
+        VoterSet voterSet = null;
+
+        for (Path segmentPath : logSegments) {
+            try (BatchFileReader reader = new BatchFileReader.Builder()
+                    .setPath(segmentPath.toString())
+                    .build()) {
+
+                while (reader.hasNext()) {
+                    BatchFileReader.BatchAndType batchAndType = reader.next();
+                    Batch<ApiMessageAndVersion> batch = batchAndType.batch();
+
+                    // Skip already-processed records
+                    if (batch.lastOffset() < fromOffset) {
+                        continue;
+                    }
+
+                    if (batchAndType.isControl()) {
+                        // Extract control records (VoterSet and KRaftVersion), but don't replay them
+                        for (ApiMessageAndVersion record : batch.records()) {
+                            if (record.message() instanceof VotersRecord) {
+                                voterSet = VoterSet.fromVotersRecord((VotersRecord) record.message());
+                            } else if (record.message() instanceof KRaftVersionRecord) {
+                                kraftVersion = ((KRaftVersionRecord) record.message()).kRaftVersion();
+                            }
+                        }
+                    } else {
+                        // Replay metadata records (not control records!)
+                        for (ApiMessageAndVersion record : batch.records()) {
+                            delta.replay(record.message());
+                        }
+                    }
+
+                    lastOffset = batch.lastOffset();
+                    lastEpoch = batch.epoch();
+                }
+            }
+        }
+
+        return lastOffset < 0 ? null : new MetadataLoadInfo(new OffsetAndEpoch(lastOffset, lastEpoch), kraftVersion, voterSet);
+    }
+
+    /**
      * Read all information needed for VoterSet update from metadata log or snapshot.
      *
      * This method orchestrates reading from multiple sources:
@@ -876,9 +1113,9 @@ public class Formatter {
 
                 // Extract control records
                 for (ControlRecord controlRecord : batch.controlRecords()) {
-                    if (controlRecord.message() instanceof VotersRecord) {
+                    if (controlRecord.type() == ControlRecordType.KRAFT_VOTERS) {
                         voterSet = VoterSet.fromVotersRecord((VotersRecord) controlRecord.message());
-                    } else if (controlRecord.message() instanceof KRaftVersionRecord) {
+                    } else if (controlRecord.type() == ControlRecordType.KRAFT_VERSION) {
                         kraftVersion = ((KRaftVersionRecord) controlRecord.message()).kRaftVersion();
                     }
                 }
