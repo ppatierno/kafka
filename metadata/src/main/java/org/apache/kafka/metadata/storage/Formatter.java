@@ -20,6 +20,7 @@ package org.apache.kafka.metadata.storage;
 import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.message.KRaftVersionRecord;
 import org.apache.kafka.common.message.VotersRecord;
+import org.apache.kafka.common.metadata.MetadataRecordType;
 import org.apache.kafka.common.utils.internals.BufferSupplier;
 import org.apache.kafka.common.utils.internals.LogContext;
 import org.apache.kafka.common.utils.Time;
@@ -861,6 +862,16 @@ public class Formatter {
      * Replay log segments into MetadataDelta.
      * Reuses file reading logic but replays all records instead of just extracting VotersRecord.
      *
+     * Handles metadata transactions (inspired by the MetadataBatchLoader logic):
+     * - Records between BEGIN_TRANSACTION_RECORD and END_TRANSACTION_RECORD are buffered
+     * - On END_TRANSACTION_RECORD, all buffered records are replayed
+     * - On ABORT_TRANSACTION_RECORD, all buffered records are discarded
+     * - Records outside transactions are replayed immediately
+     *
+     * This is a simplified version of MetadataBatchLoader's transaction handling.
+     * MetadataBatchLoader is overkill for the formatter since it manages batch boundaries,
+     * publishers, and leader tracking - none of which are needed for offline log processing.
+     *
      * @param metadataPath Path to the metadata log directory
      * @param delta MetadataDelta to replay records into
      * @param fromOffset Starting offset (exclusive) - only replay records after this offset
@@ -889,6 +900,9 @@ public class Formatter {
         KRaftVersionRecord kraftVersionRecord = null;
         VotersRecord votersRecord = null;
 
+        // Transaction handling
+        TransactionProcessor transactionProcessor = new TransactionProcessor(delta);
+
         for (Path segmentPath : logSegments) {
             try (BatchFileReader reader = new BatchFileReader.Builder()
                     .setPath(segmentPath.toString())
@@ -913,9 +927,9 @@ public class Formatter {
                             }
                         }
                     } else {
-                        // Replay metadata records (not control records!)
+                        // Process metadata records with transaction handling
                         for (ApiMessageAndVersion record : batch.records()) {
-                            delta.replay(record.message());
+                            transactionProcessor.processRecord(record);
                         }
                     }
 
@@ -925,7 +939,90 @@ public class Formatter {
             }
         }
 
+        // Validate no unclosed transaction
+        transactionProcessor.validateComplete();
+
         return lastOffset < 0 ? null : new VoterSetWriteInfo(new OffsetAndEpoch(lastOffset, lastEpoch), kraftVersionRecord, votersRecord);
+    }
+
+    /**
+     * Helper class to process metadata transactions.
+     * Simplified version of MetadataBatchLoader's transaction handling.
+     */
+    private static class TransactionProcessor {
+        enum TransactionState { NO_TRANSACTION, IN_TRANSACTION }
+
+        private final MetadataDelta delta;
+        private TransactionState state = TransactionState.NO_TRANSACTION;
+        private final List<ApiMessageAndVersion> transactionBuffer = new ArrayList<>();
+
+        TransactionProcessor(MetadataDelta delta) {
+            this.delta = delta;
+        }
+
+        void processRecord(ApiMessageAndVersion record) {
+            MetadataRecordType type = MetadataRecordType.fromId(record.message().apiKey());
+
+            switch (type) {
+                case BEGIN_TRANSACTION_RECORD:
+                    handleBegin();
+                    break;
+                case END_TRANSACTION_RECORD:
+                    handleEnd();
+                    break;
+                case ABORT_TRANSACTION_RECORD:
+                    handleAbort();
+                    break;
+                default:
+                    handleMetadataRecord(record);
+                    break;
+            }
+        }
+
+        private void handleBegin() {
+            if (state == TransactionState.IN_TRANSACTION) {
+                throw new FormatterException("Nested transactions not supported");
+            }
+            state = TransactionState.IN_TRANSACTION;
+            transactionBuffer.clear();
+        }
+
+        private void handleEnd() {
+            if (state != TransactionState.IN_TRANSACTION) {
+                throw new FormatterException("END_TRANSACTION without BEGIN");
+            }
+            // Replay all buffered records
+            for (ApiMessageAndVersion buffered : transactionBuffer) {
+                delta.replay(buffered.message());
+            }
+            transactionBuffer.clear();
+            state = TransactionState.NO_TRANSACTION;
+        }
+
+        private void handleAbort() {
+            if (state != TransactionState.IN_TRANSACTION) {
+                throw new FormatterException("ABORT_TRANSACTION without BEGIN");
+            }
+            // Discard all buffered records
+            transactionBuffer.clear();
+            state = TransactionState.NO_TRANSACTION;
+        }
+
+        private void handleMetadataRecord(ApiMessageAndVersion record) {
+            if (state == TransactionState.IN_TRANSACTION) {
+                // Buffer it
+                transactionBuffer.add(record);
+            } else {
+                // Replay immediately
+                delta.replay(record.message());
+            }
+        }
+
+        void validateComplete() {
+            if (state == TransactionState.IN_TRANSACTION) {
+                throw new FormatterException("Unclosed transaction at end of log");
+            }
+        }
     }
 
 
