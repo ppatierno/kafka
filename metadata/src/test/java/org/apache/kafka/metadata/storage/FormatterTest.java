@@ -27,6 +27,9 @@ import org.apache.kafka.common.record.internal.MemoryRecords;
 import org.apache.kafka.common.security.scram.internals.ScramFormatter;
 import org.apache.kafka.common.security.scram.internals.ScramMechanism;
 import org.apache.kafka.common.utils.Utils;
+import org.apache.kafka.image.MetadataDelta;
+import org.apache.kafka.image.MetadataImage;
+import org.apache.kafka.image.MetadataProvenance;
 import org.apache.kafka.metadata.bootstrap.BootstrapDirectory;
 import org.apache.kafka.metadata.bootstrap.BootstrapMetadata;
 import org.apache.kafka.metadata.properties.MetaProperties;
@@ -657,15 +660,17 @@ public class FormatterTest {
             Formatter.VoterSetWriteInfo writeInfo = formatter.formatter.readVoterSetWriteInfo(testEnv.directory(0));
 
             assertNotNull(writeInfo, "Should read VoterSetWriteInfo");
-            assertNotNull(writeInfo.voterSet(), "Should have VoterSet");
-            assertEquals(3, writeInfo.voterSet().voterIds().size(), "Should have 3 voters");
-            assertTrue(writeInfo.voterSet().voterIds().contains(1), "Should contain voter 1");
-            assertTrue(writeInfo.voterSet().voterIds().contains(2), "Should contain voter 2");
-            assertTrue(writeInfo.voterSet().voterIds().contains(3), "Should contain voter 3");
+            assertNotNull(writeInfo.votersRecord(), "Should have VotersRecord");
+            VoterSet voterSet = VoterSet.fromVotersRecord(writeInfo.votersRecord());
+            assertEquals(3, voterSet.voterIds().size(), "Should have 3 voters");
+            assertTrue(voterSet.voterIds().contains(1), "Should contain voter 1");
+            assertTrue(voterSet.voterIds().contains(2), "Should contain voter 2");
+            assertTrue(voterSet.voterIds().contains(3), "Should contain voter 3");
             // Bootstrap snapshot contains: Header(0), KRaftVersion(1), Voters(2), Footer(3)
             // The actual last offset is 3, not the snapshot ID (0, 0) from the filename
             assertEquals(new OffsetAndEpoch(3, 0), writeInfo.lastOffsetAndEpoch(), "Bootstrap snapshot should have last offset 3");
-            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersion(), "Should have kraft.version = 1");
+            assertNotNull(writeInfo.kraftVersionRecord(), "Should have KRaftVersionRecord");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersionRecord().kRaftVersion(), "Should have kraft.version = 1");
         }
     }
 
@@ -716,14 +721,14 @@ public class FormatterTest {
             // Read VoterSetWriteInfo, should find the updated one from the log
             Formatter.VoterSetWriteInfo writeInfo = formatter.formatter.readVoterSetWriteInfo(testEnv.directory(0));
 
-            // Verify we read the updated VoterSet from the log (not the snapshot)
+            // Verify we read the updated VotersRecord from the log (not the snapshot)
             assertNotNull(writeInfo, "Should read VoterSetWriteInfo");
-            assertNotNull(writeInfo.voterSet(), "Should have VoterSet from log");
-            assertEquals(3, writeInfo.voterSet().voterIds().size(), "Should have 3 voters");
+            assertNotNull(writeInfo.votersRecord(), "Should have VotersRecord from log");
+            VoterSet persistedVoterSet = VoterSet.fromVotersRecord(writeInfo.votersRecord());
+            assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
             assertEquals(new OffsetAndEpoch(1, 1), writeInfo.lastOffsetAndEpoch(), "Should have found offset and epoch");
-            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersion(), "Should have kraft.version = 1");
-
-            VoterSet persistedVoterSet = writeInfo.voterSet();
+            assertNotNull(writeInfo.kraftVersionRecord(), "Should have KRaftVersionRecord");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersionRecord().kRaftVersion(), "Should have kraft.version = 1");
 
             // Use VoterSetDiff to verify only endpoints changed
             VoterSet initialVoterSet = initialVoters.toVoterSet("CONTROLLER");
@@ -776,14 +781,14 @@ public class FormatterTest {
             // Read VoterSetWriteInfo which should return the LAST one (secondUpdate), not the first
             Formatter.VoterSetWriteInfo writeInfo = formatter.formatter.readVoterSetWriteInfo(testEnv.directory(0));
 
-            // Verify we read the latest VoterSet from the log (second update, not first)
+            // Verify we read the latest VotersRecord from the log (second update, not first)
             assertNotNull(writeInfo, "Should read VoterSetWriteInfo");
-            assertNotNull(writeInfo.voterSet(), "Should have VoterSet from log");
-            assertEquals(3, writeInfo.voterSet().voterIds().size(), "Should have 3 voters");
+            assertNotNull(writeInfo.votersRecord(), "Should have VotersRecord from log");
+            VoterSet persistedVoterSet = VoterSet.fromVotersRecord(writeInfo.votersRecord());
+            assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
             assertEquals(new OffsetAndEpoch(2, 1), writeInfo.lastOffsetAndEpoch(), "Should have found offset and epoch");
-            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersion(), "Should have kraft.version = 1");
-
-            VoterSet persistedVoterSet = writeInfo.voterSet();
+            assertNotNull(writeInfo.kraftVersionRecord(), "Should have KRaftVersionRecord");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersionRecord().kRaftVersion(), "Should have kraft.version = 1");
 
             // Verify the persisted VoterSet matches the second update (not the first)
             VoterSet initialVoterSet = initialVoters.toVoterSet("CONTROLLER");
@@ -1063,6 +1068,7 @@ public class FormatterTest {
     }
 
     @Test
+    @Timeout(40000)
     public void testBuildMetadataImageFromSnapshot() throws Exception {
         try (TestEnv testEnv = new TestEnv(1)) {
             // Format with dynamic quorum (creates snapshot with VotersRecord)
@@ -1077,24 +1083,35 @@ public class FormatterTest {
                 .run();
 
             // Build complete metadata
-            Formatter.LoadedMetadata loaded = formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0));
+            MetadataDelta delta = new MetadataDelta.Builder().
+                setImage(MetadataImage.EMPTY).
+                build();
+            Formatter.VoterSetWriteInfo writeInfo = formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0), delta);
 
-            // Verify VoterSet loaded
-            assertNotNull(loaded, "Should load metadata");
-            assertNotNull(loaded.voterSet(), "Should have VoterSet");
-            assertEquals(3, loaded.voterSet().voterIds().size(), "Should have 3 voters");
-            assertTrue(loaded.voterSet().voterIds().contains(1), "Should contain voter 1");
-            assertTrue(loaded.voterSet().voterIds().contains(2), "Should contain voter 2");
-            assertTrue(loaded.voterSet().voterIds().contains(3), "Should contain voter 3");
+            // Verify VotersRecord loaded
+            assertNotNull(writeInfo, "Should load metadata");
+            assertNotNull(writeInfo.votersRecord(), "Should have VotersRecord");
+            VoterSet voterSet = VoterSet.fromVotersRecord(writeInfo.votersRecord());
+            assertEquals(3, voterSet.voterIds().size(), "Should have 3 voters");
+            assertTrue(voterSet.voterIds().contains(1), "Should contain voter 1");
+            assertTrue(voterSet.voterIds().contains(2), "Should contain voter 2");
+            assertTrue(voterSet.voterIds().contains(3), "Should contain voter 3");
 
             // Verify offset/epoch
-            assertEquals(new OffsetAndEpoch(3, 0), loaded.lastOffsetAndEpoch(), "Bootstrap snapshot should have last offset 3");
-            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), loaded.kraftVersion(), "Should have kraft.version = 1");
+            assertEquals(new OffsetAndEpoch(3, 0), writeInfo.lastOffsetAndEpoch(), "Bootstrap snapshot should have last offset 3");
+            assertNotNull(writeInfo.kraftVersionRecord(), "Should have KRaftVersionRecord");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersionRecord().kRaftVersion(), "Should have kraft.version = 1");
 
             // Verify MetadataImage loaded (features, topics, etc.)
-            assertNotNull(loaded.image(), "Should have MetadataImage");
-            assertNotNull(loaded.image().features(), "Should have features");
-            assertNotNull(loaded.image().features().metadataVersion(), "Should have metadata.version");
+            MetadataProvenance provenance = new MetadataProvenance(
+                writeInfo.lastOffsetAndEpoch().offset(),
+                writeInfo.lastOffsetAndEpoch().epoch(),
+                System.currentTimeMillis(),
+                true);
+            MetadataImage image = delta.apply(provenance);
+            assertNotNull(image, "Should have MetadataImage");
+            assertNotNull(image.features(), "Should have features");
+            assertNotNull(image.features().metadataVersion(), "Should have metadata.version");
         }
     }
 
@@ -1105,8 +1122,11 @@ public class FormatterTest {
             FormatterContext formatter = testEnv.newFormatter();
 
             // Should throw exception when metadata log directory doesn't exist
+            MetadataDelta delta = new MetadataDelta.Builder().
+                setImage(MetadataImage.EMPTY).
+                build();
             FormatterException exception = assertThrows(FormatterException.class,
-                () -> formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0)));
+                () -> formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0), delta));
 
             assertTrue(exception.getMessage().contains("Metadata log directory not found"),
                 "Should indicate metadata log directory not found");
@@ -1114,7 +1134,6 @@ public class FormatterTest {
     }
 
     @Test
-    @Timeout(40000)
     public void testBuildMetadataImageFromLogs() throws Exception {
         try (TestEnv testEnv = new TestEnv(1)) {
             // Format with initial VoterSet
@@ -1140,18 +1159,21 @@ public class FormatterTest {
             writeVotersRecordToLog(logFile, updatedVotersRecord, 4L);
 
             // Build metadata - should pick up VoterSet from log
-            Formatter.LoadedMetadata loaded = formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0));
+            MetadataDelta delta = new MetadataDelta.Builder().
+                setImage(MetadataImage.EMPTY).
+                build();
+            Formatter.VoterSetWriteInfo writeInfo = formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0), delta);
 
-            // Verify VoterSet from log was loaded (not from snapshot)
-            assertNotNull(loaded.voterSet(), "Should have VoterSet");
-            assertEquals(3, loaded.voterSet().voterIds().size(), "Should have 3 voters");
-            assertTrue(loaded.voterSet().voterIds().contains(1), "Should contain voter 1");
+            // Verify VotersRecord from log was loaded (not from snapshot)
+            assertNotNull(writeInfo.votersRecord(), "Should have VotersRecord");
+            VoterSet persistedVoterSet = VoterSet.fromVotersRecord(writeInfo.votersRecord());
+            assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
+            assertTrue(persistedVoterSet.voterIds().contains(1), "Should contain voter 1");
 
             // Verify offset includes log
-            assertEquals(4L, loaded.lastOffsetAndEpoch().offset(), "Should have last offset from log");
-            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), loaded.kraftVersion(), "Should have kraft.version = 1");
-
-            VoterSet persistedVoterSet = loaded.voterSet();
+            assertEquals(4L, writeInfo.lastOffsetAndEpoch().offset(), "Should have last offset from log");
+            assertNotNull(writeInfo.kraftVersionRecord(), "Should have KRaftVersionRecord");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersionRecord().kRaftVersion(), "Should have kraft.version = 1");
 
             // Use VoterSetDiff to verify only endpoints changed
             VoterSet initialVoterSet = initialVoters.toVoterSet("CONTROLLER");
@@ -1163,12 +1185,21 @@ public class FormatterTest {
             assertFalse(diff.hasDirectoryIdChanges(), "Should not have directory ID changes");
             assertEquals(3, diff.endpointChanges().size(), "All 3 endpoints should change");
 
-            // Verify the persisted VoterSet matches the updated one
-            assertEquals(updatedVoterSet.voterIds(), persistedVoterSet.voterIds(), "VoterSet IDs should match");
+            // Verify the persisted VoterSet matches the updated one (using VoterSetDiff to handle resolved IPs)
+            VoterSetDiff persistedDiff = VoterSetDiff.compare(updatedVoterSet, persistedVoterSet, "CONTROLLER");
+            assertFalse(persistedDiff.hasVoterIdChanges(), "Persisted should have same voter IDs as updated");
+            assertFalse(persistedDiff.hasDirectoryIdChanges(), "Persisted should have same directory IDs as updated");
+            assertTrue(persistedDiff.endpointChanges().isEmpty(), "Persisted should have same endpoints as updated");
 
             // Verify MetadataImage loaded
-            assertNotNull(loaded.image(), "Should have MetadataImage");
-            assertNotNull(loaded.image().features(), "Should have features");
+            MetadataProvenance provenance = new MetadataProvenance(
+                writeInfo.lastOffsetAndEpoch().offset(),
+                writeInfo.lastOffsetAndEpoch().epoch(),
+                System.currentTimeMillis(),
+                true);
+            MetadataImage image = delta.apply(provenance);
+            assertNotNull(image, "Should have MetadataImage");
+            assertNotNull(image.features(), "Should have features");
         }
     }
 
@@ -1206,17 +1237,20 @@ public class FormatterTest {
             writeVotersRecordToLog(logFile, secondUpdateRecord, 5L);
 
             // Build metadata - should pick up the LATEST VoterSet from log
-            Formatter.LoadedMetadata loaded = formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0));
+            MetadataDelta delta = new MetadataDelta.Builder().
+                setImage(MetadataImage.EMPTY).
+                build();
+            Formatter.VoterSetWriteInfo writeInfo = formatter.formatter.buildMetadataImageFromDirectory(testEnv.directory(0), delta);
 
-            // Verify we got the latest VoterSet (second update, not first)
-            assertNotNull(loaded.voterSet(), "Should have VoterSet");
-            assertEquals(3, loaded.voterSet().voterIds().size(), "Should have 3 voters");
+            // Verify we got the latest VotersRecord (second update, not first)
+            assertNotNull(writeInfo.votersRecord(), "Should have VotersRecord");
+            VoterSet persistedVoterSet = VoterSet.fromVotersRecord(writeInfo.votersRecord());
+            assertEquals(3, persistedVoterSet.voterIds().size(), "Should have 3 voters");
 
             // Verify offset is from the last update
-            assertEquals(5L, loaded.lastOffsetAndEpoch().offset(), "Should have last offset from second update");
-            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), loaded.kraftVersion(), "Should have kraft.version = 1");
-
-            VoterSet persistedVoterSet = loaded.voterSet();
+            assertEquals(5L, writeInfo.lastOffsetAndEpoch().offset(), "Should have last offset from second update");
+            assertNotNull(writeInfo.kraftVersionRecord(), "Should have KRaftVersionRecord");
+            assertEquals(KRaftVersion.KRAFT_VERSION_1.featureLevel(), writeInfo.kraftVersionRecord().kRaftVersion(), "Should have kraft.version = 1");
 
             // Verify the persisted VoterSet matches the second update (not the first)
             VoterSet initialVoterSet = initialVoters.toVoterSet("CONTROLLER");
@@ -1236,8 +1270,14 @@ public class FormatterTest {
             assertTrue(persistedDiff.endpointChanges().isEmpty(), "Persisted should have same endpoints as second update");
 
             // Verify MetadataImage loaded
-            assertNotNull(loaded.image(), "Should have MetadataImage");
-            assertNotNull(loaded.image().features(), "Should have features");
+            MetadataProvenance provenance = new MetadataProvenance(
+                writeInfo.lastOffsetAndEpoch().offset(),
+                writeInfo.lastOffsetAndEpoch().epoch(),
+                System.currentTimeMillis(),
+                true);
+            MetadataImage image = delta.apply(provenance);
+            assertNotNull(image, "Should have MetadataImage");
+            assertNotNull(image.features(), "Should have features");
         }
     }
 
