@@ -34,6 +34,8 @@ import org.apache.kafka.metadata.util.BatchFileReader;
 import org.apache.kafka.image.MetadataDelta;
 import org.apache.kafka.image.MetadataImage;
 import org.apache.kafka.image.MetadataProvenance;
+import org.apache.kafka.image.writer.ImageWriterOptions;
+import org.apache.kafka.image.writer.RaftSnapshotWriter;
 import org.apache.kafka.common.record.internal.ControlRecordType;
 import org.apache.kafka.raft.Batch;
 import org.apache.kafka.raft.ControlRecord;
@@ -660,9 +662,17 @@ public class Formatter {
             printStream.println("Validation: PASSED (only endpoints changed, safe operation)");
             printStream.println();
 
-            // Create snapshot with updated VoterSet at next offset
-            // TODO: re-enable when implementing how to write the full snapshot
-            // createSnapshotWithUpdatedVoters(writeLogDir, writeInfo, initialControllers);
+            // Convert provided VoterSet to VotersRecord (use same version as original)
+            VotersRecord newVotersRecord = providedVoterSet.toVotersRecord(writeInfo.votersRecord().version());
+
+            // Write complete snapshot with updated VoterSet at next offset
+            writeCompleteSnapshot(
+                writeLogDir,
+                image,
+                newVotersRecord,
+                writeInfo.lastOffsetAndEpoch(),
+                writeInfo.kraftVersionRecord()
+            );
         } finally {
             // Always release the lock
             fileLock.unlockAndClose();
@@ -670,33 +680,79 @@ public class Formatter {
     }
 
     /**
-     * Create a snapshot with updated VoterSet at the next log offset.
+     * Write a complete snapshot with updated VoterSet at the next log offset.
      *
-     * This method is used by --override to create a new snapshot containing
-     * the updated VotersRecord with new DNS endpoints. The snapshot is created
-     * at the NEXT offset after the current log end, allowing controllers to load
-     * the updated VoterSet on restart without requiring quorum.
+     * This method creates a new snapshot containing:
+     * 1. Control records (SnapshotHeader, KRaftVersion, updated VotersRecord)
+     * 2. ALL metadata records from the MetadataImage (features, topics, configs, ACLs, etc.)
+     * 3. SnapshotFooter
+     *
+     * The snapshot is created at offset + 1 after the current log end, allowing
+     * controllers to load the updated VoterSet on restart without requiring quorum.
      *
      * @param writeLogDir The log directory containing the metadata log
-     * @param writeInfo VoterSet write information including last offset, epoch, and kraftVersion
-     * @param initialControllers The new initial controllers with updated endpoints to write to the snapshot
+     * @param image Complete metadata image to write to snapshot
+     * @param newVotersRecord The new VotersRecord with updated endpoints
+     * @param currentPosition Current offset and epoch (snapshot will be at offset + 1)
+     * @param kraftVersionRecord KRaftVersion control record
      */
-    private void createSnapshotWithUpdatedVoters(String writeLogDir, VoterSetWriteInfo writeInfo, Optional<DynamicVoters> initialControllers) {
+    private void writeCompleteSnapshot(
+        String writeLogDir,
+        MetadataImage image,
+        VotersRecord newVotersRecord,
+        OffsetAndEpoch currentPosition,
+        KRaftVersionRecord kraftVersionRecord
+    ) {
         // Calculate next offset for the new snapshot
-        long nextOffset = writeInfo.lastOffsetAndEpoch().offset() + 1;
-        int currentEpoch = writeInfo.lastOffsetAndEpoch().epoch();
+        long nextOffset = currentPosition.offset() + 1;
+        int currentEpoch = currentPosition.epoch();
 
-        printStream.println("Creating snapshot at offset " + nextOffset +
+        printStream.println("Creating complete snapshot at offset " + nextOffset +
                            ", epoch " + currentEpoch + " with updated VotersRecord...");
 
+        // Get metadata directory
+        File parentDir = new File(writeLogDir);
+        File clusterMetadataDirectory = new File(parentDir, String.format("%s-%d",
+                CLUSTER_METADATA_TOPIC_PARTITION.topic(),
+                CLUSTER_METADATA_TOPIC_PARTITION.partition()));
+
         OffsetAndEpoch snapshotId = new OffsetAndEpoch(nextOffset, currentEpoch);
-        writeDynamicQuorumSnapshot(
-            writeLogDir,
-            initialControllers.get(),
-            writeInfo.kraftVersionRecord().kRaftVersion(),
-            controllerListenerName,
-            snapshotId
-        );
+
+        // Build new VoterSet from VotersRecord
+        VoterSet newVoterSet = VoterSet.fromVotersRecord(newVotersRecord);
+
+        // Create RecordsSnapshotWriter with control records
+        RecordsSnapshotWriter.Builder builder = new RecordsSnapshotWriter.Builder()
+            .setLastContainedLogTimestamp(Time.SYSTEM.milliseconds())
+            .setMaxBatchSizeBytes(KafkaRaftClient.MAX_BATCH_SIZE_BYTES)
+            .setRawSnapshotWriter(FileRawSnapshotWriter.create(
+                clusterMetadataDirectory.toPath(),
+                snapshotId))
+            .setKraftVersion(KRaftVersion.fromFeatureLevel(kraftVersionRecord.kRaftVersion()))
+            .setVoterSet(Optional.of(newVoterSet));
+
+        try (RecordsSnapshotWriter<ApiMessageAndVersion> recordsWriter = builder.build(new MetadataRecordSerde())) {
+            // Check if image has metadata to write
+            if (!image.isEmpty()) {
+                // Image has metadata - write it all to the snapshot
+                // Wrap in RaftSnapshotWriter for streaming metadata records
+                RaftSnapshotWriter raftWriter = new RaftSnapshotWriter(
+                    recordsWriter,
+                    KafkaRaftClient.MAX_BATCH_SIZE_BYTES
+                );
+
+                // Write ALL metadata records from image (streaming, not buffered)
+                ImageWriterOptions options = new ImageWriterOptions.Builder(image).build();
+                image.write(raftWriter, options);
+
+                // RaftSnapshotWriter.close() will flush remaining batch and freeze
+                raftWriter.close(true);
+            } else {
+                // Image is empty (fresh format) - only control records needed
+                // The bootstrap.checkpoint file contains the metadata
+                recordsWriter.freeze();
+            }
+        }
 
         // Log snapshot creation details for operators
         String snapshotFilename = String.format("%020d-%010d.checkpoint", nextOffset, currentEpoch);
