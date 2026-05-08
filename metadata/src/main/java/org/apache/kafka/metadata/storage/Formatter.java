@@ -137,7 +137,7 @@ public class Formatter {
     /**
      * True if we should create a snapshot with updated VotersRecord when already formatted.
      */
-    private boolean override = false;
+    private boolean overrideVoters = false;
 
     /**
      * The arguments passed to --add-scram
@@ -219,8 +219,8 @@ public class Formatter {
         return this;
     }
 
-    public Formatter setOverride(boolean override) {
-        this.override = override;
+    public Formatter setOverrideVoters(boolean overrideVoters) {
+        this.overrideVoters = overrideVoters;
         return this;
     }
 
@@ -257,8 +257,8 @@ public class Formatter {
         return hasDynamicQuorum;
     }
 
-    boolean isOverride() {
-        return override;
+    boolean isOverrideVoters() {
+        return overrideVoters;
     }
 
     public BootstrapMetadata bootstrapMetadata() {
@@ -278,10 +278,10 @@ public class Formatter {
         if (controllerListenerName == null) {
             throw new FormatterException("You must specify the name of the initial controller listener.");
         }
-        // Validate override requires dynamic quorum mode with initial-controllers
-        if (override && (!hasDynamicQuorum() || initialControllers.isEmpty())) {
+        // Validate override-voters requires dynamic quorum mode with initial-controllers
+        if (overrideVoters && (!hasDynamicQuorum() || initialControllers.isEmpty())) {
             throw new FormatterException(
-                "The --override flag requires dynamic quorum mode. " +
+                "The --override-voters flag requires dynamic quorum mode. " +
                 "Use --initial-controllers to specify the voter endpoints."
             );
         }
@@ -437,7 +437,7 @@ public class Formatter {
                 OptionalInt.of(nodeId),
                 EnumSet.noneOf(MetaPropertiesEnsemble.VerificationFlag.class));
         MetaPropertiesEnsemble.Copier copier = new MetaPropertiesEnsemble.Copier(ensemble);
-        if (!(ignoreFormatted || override || copier.logDirProps().isEmpty())) {
+        if (!(ignoreFormatted || overrideVoters || copier.logDirProps().isEmpty())) {
             String firstLogDir = copier.logDirProps().keySet().iterator().next();
             throw new FormatterException("Log directory " + firstLogDir + " is already formatted. " +
                 "Use --ignore-formatted to ignore this directory and format the others.");
@@ -450,10 +450,10 @@ public class Formatter {
             }
         }
         if (ensemble.emptyLogDirs().isEmpty()) {
-            if (override) {
-                // Handle override mode: update VoterSet if needed
-                handleOverride(metadataLogDirectory.orElseThrow(() ->
-                    new FormatterException("Override mode requires metadata log directory")));
+            if (overrideVoters) {
+                // Handle override-voters mode: update VoterSet if needed
+                handleOverrideVoters(metadataLogDirectory.orElseThrow(() ->
+                    new FormatterException("Override voters mode requires metadata log directory")));
             } else {
                 printStream.println("All of the log directories are already formatted.");
             }
@@ -563,7 +563,7 @@ public class Formatter {
     }
 
     /**
-     * Handle --override mode: update VoterSet if needed.
+     * Handle --override-voters mode: update VoterSet if needed.
      *
      * This method allows to override the VoterSet in case of endpoints change (DNS/port) within the current KRaft quorum.
      *
@@ -577,7 +577,7 @@ public class Formatter {
      * @param writeLogDir The log directory containing the metadata log
      * @throws FormatterException if changes are unsafe or validation fails
      */
-    private void handleOverride(String writeLogDir) throws Exception {
+    private void handleOverrideVoters(String writeLogDir) throws Exception {
         // Get metadata directory path
         File parentDir = new File(writeLogDir);
         File clusterMetadataDirectory = new File(parentDir, String.format("%s-%d",
@@ -597,7 +597,7 @@ public class Formatter {
             }
 
             printStream.println("Storage directory " + writeLogDir + " is already formatted.");
-            printStream.println("Override mode enabled, checking if VoterSet needs updating...");
+            printStream.println("Override voters mode enabled, checking if VoterSet needs updating...");
             printStream.println();
 
             // Build complete metadata image from existing state (snapshot + logs)
@@ -631,7 +631,7 @@ public class Formatter {
 
             // Get provided VoterSet from --initial-controllers
             if (initialControllers.isEmpty()) {
-                throw new FormatterException("--override requires --initial-controllers to specify the new voter endpoints.");
+                throw new FormatterException("--override-voters requires --initial-controllers to specify the new voter endpoints.");
             }
             VoterSet providedVoterSet = initialControllers.get().toVoterSet(controllerListenerName);
             printStream.println("Provided VoterSet (from --initial-controllers):");
@@ -654,7 +654,7 @@ public class Formatter {
             // Validate safety: only endpoint changes allowed
             if (!diff.onlyEndpointsChanged()) {
                 throw new FormatterException(
-                    "--override cannot be used for changing node IDs or directory IDs.\n" +
+                    "--override-voters cannot be used for changing node IDs or directory IDs.\n" +
                     "Changes detected:\n" + diff
                 );
             }

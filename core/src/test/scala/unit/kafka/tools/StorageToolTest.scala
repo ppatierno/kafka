@@ -923,10 +923,10 @@ Found problem:
 
     val stream = new ByteArrayOutputStream()
     assertEquals(
-      "--override requires --initial-controllers to specify the new voter endpoints.",
+      "--override-voters requires --initial-controllers to specify the new voter endpoints.",
       assertThrows(classOf[TerseFailure], () =>
         runFormatCommand(stream, properties, Seq(
-          "--override",
+          "--override-voters",
           "--no-initial-controllers"
         ))).getMessage
     )
@@ -943,7 +943,7 @@ Found problem:
     assertEquals(0, runFormatCommand(stream, properties, Seq(
       "--release-version", "3.9-IV0",
       "--initial-controllers", "0@localhost:9093:K90IZ-0DRNazJ49kCZ1EMQ",
-      "--override"
+      "--override-voters"
     )))
     assertTrue(stream.toString().contains("Formatting"))
   }

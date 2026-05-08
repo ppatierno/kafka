@@ -128,7 +128,7 @@ object StorageTool extends Logging {
       setClusterId(namespace.getString("cluster_id")).
       setUnstableFeatureVersionsEnabled(config.unstableFeatureVersionsEnabled).
       setIgnoreFormatted(namespace.getBoolean("ignore_formatted")).
-      setOverride(namespace.getBoolean("override")).
+      setOverrideVoters(namespace.getBoolean("override_voters")).
       setControllerListenerName(config.controllerListenerNames.get(0)).
       setMetadataLogDirectory(config.metadataLogDir)
 
@@ -147,13 +147,13 @@ object StorageTool extends Logging {
       })
     val initialControllers = namespace.getString("initial_controllers")
     val isStandalone = namespace.getBoolean("standalone")
-    val isOverride = namespace.getBoolean("override")
+    val isOverrideVoters = namespace.getBoolean("override_voters")
     val staticVotersEmpty = config.quorumConfig.voters().isEmpty
     formatter.setHasDynamicQuorum(staticVotersEmpty)
 
-    // Validate --override requires --initial-controllers
-    if (isOverride && Option(initialControllers).isEmpty) {
-      throw new TerseFailure("--override requires --initial-controllers to specify the new voter endpoints.")
+    // Validate --override-voters requires --initial-controllers
+    if (isOverrideVoters && Option(initialControllers).isEmpty) {
+      throw new TerseFailure("--override-voters requires --initial-controllers to specify the new voter endpoints.")
     }
 
     if (!staticVotersEmpty && (Option(initialControllers).isDefined || isStandalone)) {
@@ -368,7 +368,7 @@ object StorageTool extends Logging {
         "the controller.quorum.voters config must not be set, and controller.quorum.bootstrap.servers is set instead.")
       .action(store())
 
-    formatParser.addArgument("--override")
+    formatParser.addArgument("--override-voters")
       .help("When storage is already formatted, create snapshot with new VotersRecord instead of failing. " +
         "Only allows endpoint (DNS/port) changes. Requires --initial-controllers.")
       .action(storeTrue())

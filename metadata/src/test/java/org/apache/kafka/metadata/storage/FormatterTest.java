@@ -608,7 +608,7 @@ public class FormatterTest {
             formatter.formatter
                 .setInitialControllers(DynamicVoters.parse("1@localhost:8020:4znU-ou9Taa06bmEJxsjnw"))
                 .setHasDynamicQuorum(true)
-                .setOverride(true);
+                .setOverrideVoters(true);
 
             assertTrue(true);
         }
@@ -618,10 +618,10 @@ public class FormatterTest {
     public void testOverrideRequiresInitialControllers() throws Exception {
         try (TestEnv testEnv = new TestEnv(1)) {
             FormatterContext formatter = testEnv.newFormatter();
-            formatter.formatter.setOverride(true);
+            formatter.formatter.setOverrideVoters(true);
 
             assertEquals(
-                "The --override flag requires dynamic quorum mode. " +
+                "The --override-voters flag requires dynamic quorum mode. " +
                 "Use --initial-controllers to specify the voter endpoints.",
                 assertThrows(FormatterException.class, formatter.formatter::run).getMessage()
             );
@@ -634,7 +634,7 @@ public class FormatterTest {
             // Try to use override without dynamic quorum (static quorum mode)
             FormatterContext formatter = testEnv.newFormatter();
             formatter.formatter
-                .setOverride(true)
+                .setOverrideVoters(true)
                 .setHasDynamicQuorum(false);  // Explicitly set to static quorum
 
             FormatterException exception = assertThrows(FormatterException.class, formatter.formatter::run);
@@ -659,7 +659,7 @@ public class FormatterTest {
                     .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
                     .run();
 
-            // Step 2: Run format --override on already-formatted storage
+            // Step 2: Run format --override-voters on already-formatted storage
             // This should NOT throw "already formatted" error
             DynamicVoters newVoters = DynamicVoters.parse("1@localhost:9094:4znU-ou9Taa06bmEJxsjnw");
             FormatterContext formatter2 = testEnv.newFormatter();
@@ -668,15 +668,15 @@ public class FormatterTest {
                     .setInitialControllers(newVoters)
                     .setHasDynamicQuorum(true)
                     .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
-                    .setOverride(true);
+                    .setOverrideVoters(true);
 
             // This should not throw an exception
             assertDoesNotThrow(() -> formatter2.formatter.run(),
-                    "Format with --override should not fail on already-formatted storage");
+                    "Format with --override-voters should not fail on already-formatted storage");
 
             // Verify output contains expected messages
             String output = formatter2.output();
-            assertTrue(output.contains("Override mode enabled"), "Should show override mode message");
+            assertTrue(output.contains("Override voters mode enabled"), "Should show override mode message");
             assertTrue(output.contains("Validation: PASSED"), "Should show validation passed");
         }
     }
@@ -695,7 +695,7 @@ public class FormatterTest {
                 .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
                 .run();
 
-            // Step 2: Run format --override with new endpoints (only port changes)
+            // Step 2: Run format --override-voters with new endpoints (only port changes)
             DynamicVoters newVoters = DynamicVoters.parse(
                 "1@localhost:9096:4znU-ou9Taa06bmEJxsjnw,2@localhost:9097:5znU-ou9Taa06bmEJxsjnx,3@localhost:9098:6znU-ou9Taa06bmEJxsjny");
             FormatterContext formatter2 = testEnv.newFormatter();
@@ -704,12 +704,12 @@ public class FormatterTest {
                 .setInitialControllers(newVoters)
                 .setHasDynamicQuorum(true)
                 .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
-                .setOverride(true)
+                .setOverrideVoters(true)
                 .run();
 
             // Verify output messages
             String output = formatter2.output();
-            assertTrue(output.contains("Override mode enabled"), "Should show override mode enabled");
+            assertTrue(output.contains("Override voters mode enabled"), "Should show override mode enabled");
             assertTrue(output.contains("Persisted VoterSet"), "Should show persisted VoterSet");
             assertTrue(output.contains("Provided VoterSet"), "Should show provided VoterSet");
             assertTrue(output.contains("Changes detected"), "Should show changes detected");
@@ -731,19 +731,19 @@ public class FormatterTest {
                 .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
                 .run();
 
-            // Step 2: Run format --override with SAME endpoints (idempotence test)
+            // Step 2: Run format --override-voters with SAME endpoints (idempotence test)
             FormatterContext formatter2 = testEnv.newFormatter();
             formatter2.formatter
                 .setUnstableFeatureVersionsEnabled(true)
                 .setInitialControllers(voters)
                 .setHasDynamicQuorum(true)
                 .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
-                .setOverride(true)
+                .setOverrideVoters(true)
                 .run();
 
             // Verify idempotence - should skip with no changes
             String output = formatter2.output();
-            assertTrue(output.contains("Override mode enabled"), "Should show override mode enabled");
+            assertTrue(output.contains("Override voters mode enabled"), "Should show override mode enabled");
             assertTrue(output.contains("No changes detected (VoterSets are equivalent). Override operation skipped, already up to date."), "Should detect no changes and skip override");
         }
     }
@@ -771,12 +771,12 @@ public class FormatterTest {
                 .setInitialControllers(newVoters)
                 .setHasDynamicQuorum(true)
                 .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
-                .setOverride(true);
+                .setOverrideVoters(true);
 
             // Should throw exception for voter ID changes
             FormatterException exception = assertThrows(FormatterException.class,
                 () -> formatter2.formatter.run());
-            assertTrue(exception.getMessage().contains("--override cannot be used for changing node IDs or directory IDs."),
+            assertTrue(exception.getMessage().contains("--override-voters cannot be used for changing node IDs or directory IDs."),
                 "Should reject voter ID changes");
         }
     }
@@ -802,12 +802,12 @@ public class FormatterTest {
                 .setInitialControllers(newVoters)
                 .setHasDynamicQuorum(true)
                 .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
-                .setOverride(true);
+                .setOverrideVoters(true);
 
             // Should throw exception for directory ID changes (prevents data loss)
             FormatterException exception = assertThrows(FormatterException.class,
                 () -> formatter2.formatter.run());
-            assertTrue(exception.getMessage().contains("--override cannot be used for changing node IDs or directory IDs."),
+            assertTrue(exception.getMessage().contains("--override-voters cannot be used for changing node IDs or directory IDs."),
                 "Should reject directory ID changes");
         }
     }
@@ -840,7 +840,7 @@ public class FormatterTest {
                     .setInitialControllers(newVoters)
                     .setHasDynamicQuorum(true)
                     .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
-                    .setOverride(true);
+                    .setOverrideVoters(true);
 
                 // Should throw exception because lock is held
                 FormatterException exception = assertThrows(FormatterException.class, () -> formatter2.formatter.run());
@@ -874,11 +874,11 @@ public class FormatterTest {
                 .setInitialControllers(invalidVoters)
                 .setHasDynamicQuorum(true)
                 .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
-                .setOverride(true);
+                .setOverrideVoters(true);
 
             // Should throw exception due to directory ID change
             FormatterException exception = assertThrows(FormatterException.class, () -> formatter2.formatter.run());
-            assertTrue(exception.getMessage().contains("--override cannot be used for changing node IDs or directory IDs"), "Should reject directory ID changes");
+            assertTrue(exception.getMessage().contains("--override-voters cannot be used for changing node IDs or directory IDs"), "Should reject directory ID changes");
 
             // Step 3: Verify lock was released by successfully acquiring it
             File metadataDir = new File(testEnv.directories.get(0), "__cluster_metadata-0");
@@ -897,7 +897,7 @@ public class FormatterTest {
                 .setInitialControllers(validVoters)
                 .setHasDynamicQuorum(true)
                 .setFeatureLevel(KRaftVersion.FEATURE_NAME, KRaftVersion.KRAFT_VERSION_1.featureLevel())
-                .setOverride(true);
+                .setOverrideVoters(true);
 
             // Should succeed now - proves lock was released and retry works
             assertDoesNotThrow(() -> formatter3.formatter.run(), "Should be able to retry override after previous error");
